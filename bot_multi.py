@@ -37,8 +37,38 @@ ORDER_MODE       = os.environ.get("ORDER_MODE","maker_then_market")  # market|ma
 MAKER_TTL_SEC    = env_float("MAKER_TTL_SEC", 10.0)
 MAKER_OFFSET_BPS = env_float("MAKER_OFFSET_BPS", 1.0)  # 1 = 0.01%
 
+# --- Enhancements from ADA bot style ---
+MAX_DCA = int(os.environ.get("MAX_DCA", "4"))
+TP_PCT = env_float("TP_PCT", 0.002)                    # 0.2%
+EMERGENCY_SL_PCT = env_float("EMERGENCY_SL_PCT", 0.01) # 1.0%
+FLIP_ON_PROFIT = os.environ.get("FLIP_ON_PROFIT", "1") == "1"
+
+VOL_SCALE_LONG = env_float("VOL_SCALE_LONG", 1.0)      # e.g., 1.2 -> +20% per leg
+VOL_SCALE_SHORT = env_float("VOL_SCALE_SHORT", 1.0)
+
+CROSS_BUDGET_USDT = env_float("CROSS_BUDGET_USDT", 0.0)  # 0 = disabled
+RESERVE_PCT = env_float("RESERVE_PCT", 0.10)             # reserve 10%
+
+SEED_FROM_LAST = os.environ.get("SEED_FROM_LAST", "1") == "1"
+
 PAIRS_FILE = os.environ.get("PAIRS_FILE","46cap.txt")
 
+
+# --- Simple API rate limiters to avoid 10006 ---
+class RateLimiter:
+    def __init__(self, min_interval_sec: float):
+        self.min_interval = float(min_interval_sec)
+        self._last = 0.0
+    def wait(self):
+        now = time.monotonic()
+        dt = now - self._last
+        if dt < self.min_interval:
+            time.sleep(self.min_interval - dt)
+        self._last = time.monotonic()
+
+api_rl_switch = RateLimiter(0.18)
+api_rl_leverage = RateLimiter(0.18)
+api_rl_misc = RateLimiter(0.08)
 def read_pairs(path: str) -> list:
     syms = []
     try:
@@ -75,19 +105,33 @@ def bulls_signal_from_klines(klines: List[List[str]]):
     return lelex[-1]
 
 class Trader:
-    def __init__(self, http: HTTP, symbol: str):
-        self.http = http; self.symbol = symbol
+    def __init__(self, http: HTTP, symbol: str, ctx=None):
+        self.http = http; self.symbol = symbol; self.ctx = ctx
+        api_rl_misc.wait()
         info = self.http.get_instruments_info(category=CATEGORY, symbol=symbol)
         inst = info["result"]["list"][0]
+        status = str(inst.get("status", "")).lower()
+        if status not in ("trading","live","1"):
+            raise RuntimeError(f"{symbol} contract not live: {inst.get('status')}")
         lot = inst["lotSizeFilter"]; pricef = inst["priceFilter"]
         self.qty_step = float(lot["qtyStep"]); self.min_qty = float(lot["minOrderQty"])
         self.tick_size = float(pricef["tickSize"])
 
         try:
-            self.http.switch_position_mode(category=CATEGORY, symbol=symbol, mode=0)
+            api_rl_switch.wait()
+            try:
+                self.http.switch_position_mode(category=CATEGORY, symbol=symbol, mode=0)
+                logging.info("[%s] position mode set to One-Way", symbol)
+            except Exception as ie:
+                msg = str(ie)
+                if "110025" in msg:
+                    logging.debug("[%s] position mode already One-Way", symbol)
+                else:
+                    raise
         except Exception as e:
             logging.warning("[%s] position mode set failed: %s", symbol, e)
         try:
+            api_rl_leverage.wait()
             self.http.set_leverage(category=CATEGORY, symbol=symbol,
                                    buyLeverage=str(LEVERAGE_X), sellLeverage=str(LEVERAGE_X))
         except Exception as e:
@@ -179,8 +223,22 @@ class Trader:
         return False
 
     def open_leg(self, direction: int, ref_px: float):
-        qty = self._rq(LEG_USDT / max(ref_px,1e-9))
+        # Geo-scaling
+        leg_index = self.legs  # 0 for first leg
+        scale = VOL_SCALE_LONG if direction > 0 else VOL_SCALE_SHORT
+        leg_usdt = LEG_USDT * (scale ** leg_index)
+        # Cross-budget check
+        if CROSS_BUDGET_USDT > 0 and self.ctx is not None and hasattr(self.ctx, "total_exposure_usdt"):
+            used = self.ctx.total_exposure_usdt()
+            budget = CROSS_BUDGET_USDT * (1.0 - RESERVE_PCT)
+            left = budget - used
+            if left <= 0:
+                logging.info("[%s] Cross budget exhausted; skip leg", self.symbol)
+                return False
+            leg_usdt = min(leg_usdt, left)
+        qty = self._rq(leg_usdt / max(ref_px, 1e-9))
         if qty <= 0:
+
             logging.warning("[%s] Qty too small; increase LEG_USDT.", self.symbol)
             return False
         ok = self.place_with_mode("long" if direction>0 else "short", qty, reduce=False)
@@ -212,7 +270,13 @@ class Trader:
             self.funding_paid += notional * FUNDING_8H
             self.funding_anchor += period
 
-    def unreal_pnl(self, price: float) -> float:
+    
+    def current_notional_usdt(self):
+        if self.dir == 0 or self.qty <= 0:
+            return 0.0
+        _,_, mid = self.ticker()
+        return abs(self.qty * mid)
+def unreal_pnl(self, price: float) -> float:
         if self.dir == 0 or self.avg is None or self.qty<=0: return 0.0
         gross = (price/self.avg - 1.0) if self.dir>0 else (1.0 - price/self.avg)
         px_pnl = self.qty * self.avg * gross
@@ -221,6 +285,9 @@ class Trader:
 
     def step(self):
         kl = self.klines_1h(limit=200)
+        if not kl or len(kl) < 60:
+            logging.debug("[%s] insufficient klines; skip", self.symbol)
+            return
         last_ts = int(kl[-1][0])
         if getattr(self, "last_bar_ts", None) == last_ts:
             return
@@ -232,6 +299,19 @@ class Trader:
         self.accrue_funding(price)
         upnl = self.unreal_pnl(price)
 
+        # --- Soft TP/SL triggers (logic-level) ---
+        if self.dir != 0 and self.avg:
+            tp_px = self.avg * (1.0 + self.dir * TP_PCT)
+            sl_px = self.avg * (1.0 - self.dir * EMERGENCY_SL_PCT)
+            if (self.dir > 0 and price >= tp_px) or (self.dir < 0 and price <= tp_px):
+                logging.info("[%s] TP hit at %.4f (avg %.4f)", self.symbol, price, self.avg)
+                self.close_all()
+                return
+            if (self.dir > 0 and price <= sl_px) or (self.dir < 0 and price >= sl_px):
+                logging.info("[%s] Emergency SL hit at %.4f (avg %.4f)", self.symbol, price, self.avg)
+                self.close_all()
+                return
+
         if self.dir == 0:
             if sig != 0:
                 self.open_leg(sig, price)
@@ -239,7 +319,10 @@ class Trader:
 
         if sig == self.dir:
             if upnl < 0:
-                self.open_leg(self.dir, price)
+                if (MAX_DCA < 0) or (self.legs < 1 + MAX_DCA):
+                    self.open_leg(self.dir, price)
+                else:
+                    logging.info("[%s] MAX_DCA reached; skip DCA", self.symbol)
             return
 
         if sig == -self.dir:
@@ -247,7 +330,7 @@ class Trader:
                 self.close_all()
                 self.open_leg(sig, price)
             else:
-                if upnl >= 0:
+                if upnl >= 0 or (FLIP_ON_PROFIT and upnl > 0):
                     self.close_all()
                     self.open_leg(sig, price)
             return
@@ -261,14 +344,23 @@ class MultiBot:
         self.traders: Dict[str, Trader] = {}
         for s in symbols:
             try:
-                self.traders[s] = Trader(self.http, s)
+                self.traders[s] = Trader(self.http, s, ctx=self)
                 logging.info("Loaded %s", s)
             except Exception as e:
                 logging.error("Init %s failed: %s", s, e)
 
-    def loop(self):
-        logging.info("MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%sx, fee=%.4f, funding_8h=%.6f, order_mode=%s",
-                     len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H, ORDER_MODE)
+    
+    def total_exposure_usdt(self):
+        total = 0.0
+        for t in self.traders.values():
+            try:
+                total += t.current_notional_usdt()
+            except Exception:
+                pass
+        return total
+def loop(self):
+        logging.info("MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%sx, fee=%.4f, funding_8h=%.6f, order_mode=%s, max_dca=%d",
+                     len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H, ORDER_MODE, MAX_DCA)
         while True:
             for s, t in list(self.traders.items()):
                 try:
