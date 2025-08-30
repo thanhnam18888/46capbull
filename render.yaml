@@ -1,0 +1,36 @@
+
+services:
+  - type: worker
+    name: bulls-dca-bot-multi
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_multi.py
+    autoDeploy: true
+    envVars:
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: CATEGORY
+        value: linear
+      - key: PAIRS_FILE
+        value: 46cap.txt
+      - key: LEG_USDT
+        value: "2.5"
+      - key: LEVERAGE_X
+        value: "5"
+      - key: TAKER_FEE
+        value: "0"
+      - key: FUNDING_RATE_8H
+        value: "0"
+      - key: ORDER_MODE
+        value: maker_then_market
+      - key: MAKER_TTL_SEC
+        value: "10"
+      - key: MAKER_OFFSET_BPS
+        value: "1"
+      - key: POLL_SEC
+        value: "30"
+      - key: LOG_LEVEL
+        value: INFO
