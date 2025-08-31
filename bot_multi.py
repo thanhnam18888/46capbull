@@ -407,19 +407,41 @@ class MultiBot:
             m[sym] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
         return m
 
-    def _filter_live(self, symbols: List[str]) -> List[str]:
-        live: List[str] = []
-        info = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=5000).get_instruments_info(category="linear")
-        status_map = {it["symbol"].upper(): it.get("status", "") for it in info["result"]["list"]}
-        for s in symbols:
-            st = str(status_map.get(s, "")).lower()
+    
+def _filter_live(self, symbols: List[str]) -> List[str]:
+    live: List[str] = []
+    for s in symbols:
+        try:
+            # 1) Try instrument status (linear)
+            rl_misc.wait()
+            r = self.client.get_instruments_info(category="linear", symbol=s)
+            lst = r.get("result", {}).get("list", [])
+            st  = str(lst[0].get("status", "")).lower() if lst else ""
+
             if st in ("trading", "1", "live"):
                 live.append(s)
-            else:
-                logging.error("[%s] contract not live (%s); skip", s, st)
-        return live
+                continue
 
-    def total_exposure_usdt(self, sym_hint: Optional[str] = None, price_hint: Optional[float] = None) -> float:
+            # 2) Soft fallback: if kline returns data for linear, treat as live
+            try:
+                rl_kline.wait()
+                kr = self.client.get_kline(category="linear", symbol=s, interval="60", limit=2)
+                if kr.get("result", {}).get("list"):
+                    live.append(s)
+                    continue
+            except Exception:
+                pass
+
+            # 3) Not live (or unknown + no kline)
+            logging.error("[%s] contract not live (%s); skip", s, st or "unknown")
+        except Exception as e:
+            # API hiccup -> allow symbol; runtime will handle errors later
+            logging.warning("[%s] status check error: %s; allowing symbol", s, e)
+            live.append(s)
+    return live
+
+
+def total_exposure_usdt(self, sym_hint: Optional[str] = None, price_hint: Optional[float] = None) -> float:
         total = 0.0
         for s, t in self.traders.items():
             if getattr(t, "_disabled", False) or t.dir == 0 or t.qty <= 0:
