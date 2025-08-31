@@ -402,19 +402,39 @@ class MultiBot:
         logging.info("MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
                      len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H)
 
-    def _load_instruments(self) -> Dict[str, Dict[str, float]]:
+    
+def _load_instruments(self) -> Dict[str, Dict[str, float]]:
         m: Dict[str, Dict[str, float]] = {}
-        rl_misc.wait()
-        r = self.client.get_instruments_info(category=CATEGORY)
-        for it in r["result"]["list"]:
-            sym = it["symbol"].upper()
-            lot = it.get("lotSizeFilter", {}) or {}
-            px  = it.get("priceFilter", {}) or {}
-            qty_step = float(lot.get("qtyStep", "0.001"))
-            min_qty  = float(lot.get("minOrderQty", "0.001"))
-            tick     = float(px.get("tickSize", "0.001"))
-            m[sym] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
+        for s in self.symbols:
+            try:
+                rl_misc.wait()
+                r = self.client.get_instruments_info(category=CATEGORY, symbol=s)
+                lst = r.get("result", {}).get("list", [])
+                if not lst:
+                    logging.warning("[%s] instruments info empty; using defaults", s)
+                    m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
+                    continue
+                it = lst[0]
+                lot = it.get("lotSizeFilter", {}) or {}
+                px  = it.get("priceFilter", {}) or {}
+                try:
+                    qty_step = float(lot.get("qtyStep", "0.001"))
+                except Exception:
+                    qty_step = 0.001
+                try:
+                    min_qty  = float(lot.get("minOrderQty", "0.001"))
+                except Exception:
+                    min_qty = 0.001
+                try:
+                    tick     = float(px.get("tickSize", "0.001"))
+                except Exception:
+                    tick = 0.001
+                m[s] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
+            except Exception as e:
+                logging.warning("[%s] instruments info error: %s; using defaults", s, e)
+                m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
         return m
+
 
     def _filter_live(self, symbols: List[str]) -> List[str]:
         live: List[str] = []
