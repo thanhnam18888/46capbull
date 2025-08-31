@@ -8,6 +8,8 @@
 # - Per-symbol lot filters (qtyStep/minQty/tick); Soft live filter (status + kline fallback)
 # - Anti-spam logging (LOG_LEVEL, LOG_VERBOSE_INIT, LOG_THROTTLE_SEC)
 # - Throttled API calls; Fail-fast if BYBIT_API_KEY/SECRET missing
+# - Bar-close scheduler to fire orders a few seconds after H1 close (no ~:05 delays)
+# - STARTUP_PASS: run an immediate bar-close pass at startup so you can test at 04:20
 #
 import os
 import time
@@ -40,7 +42,6 @@ CATEGORY         = "linear"
 LEVERAGE_X       = env_float("LEVERAGE_X", 5.0)
 LEG_USDT         = env_float("LEG_USDT", 15.0)
 PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
-POLL_SEC         = env_float("POLL_SEC", 2.5)
 
 TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
 FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)    # 0 by default
@@ -62,6 +63,14 @@ RESERVE_PCT      = env_float("RESERVE_PCT", 0.10)
 LOG_LEVEL        = env_str("LOG_LEVEL", "INFO").upper()
 LOG_VERBOSE_INIT = env_int("LOG_VERBOSE_INIT", 0) == 1      # per-symbol init chatter
 LOG_THROTTLE_SEC = env_float("LOG_THROTTLE_SEC", 30.0)      # per-symbol error throttle
+
+# Bar-close scheduler
+BARFRAME_SEC              = env_float("BARFRAME_SEC", 3600.0)
+CLOSE_GRACE_SEC           = env_float("CLOSE_GRACE_SEC", 2.0)
+CLOSE_PASS_RETRIES        = env_int("CLOSE_PASS_RETRIES", 2)
+CLOSE_PASS_RETRY_GAP      = env_float("CLOSE_PASS_RETRY_GAP", 1.0)
+IDLE_POLL_SEC             = env_float("IDLE_POLL_SEC", 10.0)
+STARTUP_PASS              = env_int("STARTUP_PASS", 1)
 
 _level_map = {
     "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
@@ -433,6 +442,13 @@ class Trader:
         self._switch_one_way()
         self._set_leverage()
 
+# ---------- Time helpers ----------
+def _next_bar_close(now: Optional[float] = None) -> int:
+    if now is None:
+        now = time.time()
+    bf = int(BARFRAME_SEC)
+    return (int(now) // bf) * bf + bf
+
 # ---------- MultiBot ----------
 class MultiBot:
     def __init__(self, symbols: List[str]):
@@ -537,23 +553,53 @@ class MultiBot:
             total += abs(t.qty * price)
         return total
 
+    def _barclose_pass(self):
+        # One pass across all symbols to evaluate bar-close signals.
+        for s, t in list(self.traders.items()):
+            if getattr(t, "_disabled", False):
+                continue
+            try:
+                t.step()
+            except Exception as e:
+                now = time.time()
+                last = self._err_gate.get(s, 0.0)
+                if now - last >= LOG_THROTTLE_SEC:
+                    self._err_gate[s] = now
+                    logging.exception("[%s] step error: %s", s, e)
+                else:
+                    msg = str(e).splitlines()[0]
+                    logging.warning("[%s] step error (muted): %s", s, msg)
+
     def loop(self):
+        # Align to next H1 close
+        next_close = _next_bar_close()
+        # Immediate bar-close pass on startup for quick testing (e.g., deploy at 04:20)
+        if STARTUP_PASS:
+            self._barclose_pass()
+            for _ in range(int(CLOSE_PASS_RETRIES)):
+                time.sleep(CLOSE_PASS_RETRY_GAP)
+                self._barclose_pass()
+
         while True:
-            for s, t in list(self.traders.items()):
-                if getattr(t, "_disabled", False):
-                    continue
-                try:
-                    t.step()
-                except Exception as e:
-                    now = time.time()
-                    last = self._err_gate.get(s, 0.0)
-                    if now - last >= LOG_THROTTLE_SEC:
-                        self._err_gate[s] = now
-                        logging.exception("[%s] step error: %s", s, e)
-                    else:
-                        msg = str(e).splitlines()[0]
-                        logging.warning("[%s] step error (muted): %s", s, msg)
-            time.sleep(POLL_SEC)
+            now = time.time()
+            # Far from close -> idle sleep
+            if now < next_close - 15.0:
+                time.sleep(min(IDLE_POLL_SEC, (next_close - now - 15.0)))
+                continue
+
+            # Wait until just after close to ensure the last bar is finalized on the API
+            if now < next_close + CLOSE_GRACE_SEC:
+                time.sleep(next_close + CLOSE_GRACE_SEC - now)
+                now = time.time()
+
+            # Run the pass at bar close (+grace). Do quick retries if some symbols' klines are late.
+            self._barclose_pass()
+            for _ in range(int(CLOSE_PASS_RETRIES)):
+                time.sleep(CLOSE_PASS_RETRY_GAP)
+                self._barclose_pass()
+
+            # Move to next bar close
+            next_close += int(BARFRAME_SEC)
 
 # ---------- Main ----------
 if __name__ == "__main__":
