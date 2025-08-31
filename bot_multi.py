@@ -1,7 +1,13 @@
 # bot_multi.py — Multi-symbol DCA bot for Bybit linear perp (Render)
-# Features: parity with 18.py, TP maker-first + TTL (fallback market), emergency SL,
-# MAX_DCA=-1 default, flip-on-profit, geo-scaling, cross-budget, soft live filter (kline fallback),
-# per-symbol lot filters, throttled API, fail-fast if keys missing, closed-candle signals only.
+# Features:
+# - Signal matches 18.py (bar-close Lelec): length=50, bars=30, with O/C checks & indices
+# - Uses only CLOSED H1 candles (drop the latest in-progress bar)
+# - TP maker-first (PostOnly) with TTL and market fallback; Emergency SL (market)
+# - MAX_DCA=-1 default (unlimited); Flip-on-profit; Geo-scaling per leg
+# - Cross-budget control via total exposure
+# - Per-symbol lot filters (qtyStep/minQty/tick); Soft live filter (status + kline fallback)
+# - Anti-spam logging (LOG_LEVEL, LOG_VERBOSE_INIT, LOG_THROTTLE_SEC)
+# - Throttled API calls; Fail-fast if BYBIT_API_KEY/SECRET missing
 #
 import os
 import time
@@ -36,8 +42,8 @@ LEG_USDT         = env_float("LEG_USDT", 15.0)
 PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
 POLL_SEC         = env_float("POLL_SEC", 2.5)
 
-TAKER_FEE        = env_float("TAKER_FEE", 0.0)
-FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)
+TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
+FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)    # 0 by default
 
 MAX_DCA          = env_int("MAX_DCA", -1)               # -1 = unlimited
 TP_PCT           = env_float("TP_PCT", 0.0)             # 0 = disabled
@@ -99,31 +105,53 @@ def read_pairs(path: str) -> List[str]:
             out.append(s)
     return out
 
-def round_step(x: float, step: float) -> float:
+def round_step_floor(x: float, step: float) -> float:
     if step <= 0:
         return x
-    # floor to nearest step to avoid exceeding max precision
-    k = int(x / step + 1e-12)
+    k = int(x / step + 1e-12)  # floor
     v = k * step
     return v if v > 0 else step
 
-def lelec_signal_from_klines(kl: List[List[float]], n: int = 50, minbars: int = 30) -> int:
-    if not kl or len(kl) < max(n, minbars) + 1:
-        return 0
-    highs = [float(x[2]) for x in kl]
-    lows  = [float(x[3]) for x in kl]
-    last  = len(kl) - 1
-    seg_hi = highs[last - n:last]
-    seg_lo = lows[last - n:last]
-    if not seg_hi or not seg_lo:
-        return 0
-    hh = max(seg_hi); hi = seg_hi.index(hh) + (last - n)
-    ll = min(seg_lo);  li = seg_lo.index(ll) + (last - n)
-    if hi <= last - minbars and highs[last] >= hh:
-        return +1
-    if li <= last - minbars and lows[last]  <= ll:
-        return -1
-    return 0
+# --- Lelec signal like 18.py (bar close) ---
+def bulls_signal_from_klines_barclose(klines: List[List[float]]) -> List[int]:
+    length = 50
+    bars = 30
+    o = [float(x[1]) for x in klines]
+    h = [float(x[2]) for x in klines]
+    l = [float(x[3]) for x in klines]
+    c = [float(x[4]) for x in klines]
+    n = len(c)
+    if n < max(length, 35):
+        return [0] * n
+
+    highest = [0.0] * n
+    lowest  = [0.0] * n
+    for i in range(n):
+        lo = max(0, i - length + 1)
+        highest[i] = max(h[lo:i+1])
+        lowest[i]  = min(l[lo:i+1])
+
+    bindex = 0
+    sindex = 0
+    lelex  = [0] * n
+
+    for i in range(n):
+        if i >= 4 and c[i] > c[i - 4]:
+            bindex += 1
+        if i >= 4 and c[i] < c[i - 4]:
+            sindex += 1
+
+        condShort = (bindex > bars) and (c[i] < o[i]) and (h[i] >= highest[i])
+        condLong  = (sindex > bars) and (c[i] > o[i]) and (l[i] <= lowest[i])
+
+        if condShort:
+            bindex = 0
+            lelex[i] = -1
+        elif condLong:
+            sindex = 0
+            lelex[i] = 1
+
+    return lelex
 
 # ---------- Trader ----------
 class Trader:
@@ -214,7 +242,7 @@ class Trader:
             leg_usdt = min(leg_usdt, left)
 
         qty = leg_usdt / price
-        qty = round_step(qty, self.qty_step)
+        qty = round_step_floor(qty, self.qty_step)
         return max(qty, self.min_qty)
 
     def place_market(self, side: str, qty: float, reduce_only: bool = False):
@@ -265,7 +293,8 @@ class Trader:
             self.qty = new_qty
             self.legs += 1
 
-        self.entry_fees += self.qty * price * TAKER_FEE
+        # add only the new leg's taker fee (keep 0 by default)
+        self.entry_fees += qty * price * TAKER_FEE
         if self.funding_anchor is None:
             self.funding_anchor = time.time()
 
@@ -324,7 +353,9 @@ class Trader:
             return
         self.last_bar_ts = last_ts
 
-        sig = lelec_signal_from_klines(kl_closed, n=50, minbars=30)
+        # 18.py-matching signal
+        sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
+
         _, _, price = self.ticker()
 
         self._funding_tick(price)
@@ -336,7 +367,7 @@ class Trader:
                 if not self.tp_pending:
                     reached = (self.dir > 0 and price >= want_tp) or (self.dir < 0 and price <= want_tp)
                     if reached:
-                        tp_px = round_step(want_tp, self.tick)
+                        tp_px = round_step_floor(want_tp, self.tick)
                         side = "Sell" if self.dir > 0 else "Buy"
                         oid = self.place_limit(side, self.qty, tp_px, reduce_only=True, post_only=TP_POST_ONLY)
                         if oid:
@@ -520,7 +551,6 @@ class MultiBot:
                         self._err_gate[s] = now
                         logging.exception("[%s] step error: %s", s, e)
                     else:
-                        # muted repeats
                         msg = str(e).splitlines()[0]
                         logging.warning("[%s] step error (muted): %s", s, msg)
             time.sleep(POLL_SEC)
