@@ -1,18 +1,20 @@
-
-# bot_multi.py — Multi-symbol Bulls DCA bot (Render) — auto-reverse like 18.py
-# Core logic (breakeven ignores fees per user's parity request):
-# - On each closed 1H bar, compute Lelec(50/30) signal s ∈ {-1,0,+1}.
+# bot_multi.py — Multi-symbol DCA bot for Bybit linear perp
+# Core rules (parity with 18.py, breakeven ignores fees):
+# - On each closed 1H bar: compute Lelec(50/30) signal s ∈ {-1,0,+1}.
 # - If Flat and s!=0: OPEN 1 leg in direction s.
-# - If In Position and s==dir and UPNL<0: DCA add one leg.
+# - If In Position and s==dir and unrealized PnL<0: DCA one more leg.
 # - If Opposite signal:
 #     * if legs==1: CLOSE then immediately OPEN opposite (same bar).
-#     * if legs>1: only close&reverse when breakeven (UPNL>=0).
+#     * if legs>1: only close&reverse when breakeven (PnL>=0).
 # - If No signal and legs>1 and breakeven: CLOSE now.
 #
 # Extras:
-# - MAX_DCA default -1 (unlimited). Flip-on-profit switch. Geo-scaling per leg.
-# - Cross-budget cap across all symbols. API call throttling. Filter non-live symbols.
+# - MAX_DCA default -1 (unlimited). Flip-on-profit switch.
+# - Geo-scaling per leg (VOL_SCALE_LONG/SHORT).
+# - Cross-budget cap across all symbols.
 # - TP: maker-first (PostOnly) with TTL; fallback to market. SL: emergency market.
+# - Throttled API calls; filter non-live with kline fallback.
+# - Fail-fast if API keys missing.
 #
 import os, time, logging
 from typing import List, Dict, Optional, Tuple
@@ -43,7 +45,7 @@ LEG_USDT         = env_float("LEG_USDT", 15.0)
 PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
 POLL_SEC         = env_float("POLL_SEC", 2.5)
 
-TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # set 0 for parity with 18.py
+TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
 FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)    # 0 by default
 
 MAX_DCA          = env_int("MAX_DCA", -1)               # -1 = unlimited
@@ -60,6 +62,9 @@ CROSS_BUDGET_USDT= env_float("CROSS_BUDGET_USDT", 0.0)  # 0 = disabled
 RESERVE_PCT      = env_float("RESERVE_PCT", 0.10)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    raise SystemExit("BYBIT_API_KEY / BYBIT_API_SECRET are required but missing. Set them in Render → Environment.")
 
 class RateLimiter:
     def __init__(self, min_interval_sec: float):
@@ -104,8 +109,12 @@ def lelec_signal_from_klines(kl: List[List[float]], n: int = 50, minbars: int = 
     highs = [float(x[2]) for x in kl]
     lows  = [float(x[3]) for x in kl]
     last  = len(kl) - 1
-    hh = max(highs[last - n:last]); hi = highs[last - n:last].index(hh) + (last - n)
-    ll = min(lows[last - n:last]);  li = lows[last - n:last].index(ll) + (last - n)
+    seg_hi = highs[last - n:last]
+    seg_lo = lows[last - n:last]
+    if not seg_hi or not seg_lo:
+        return 0
+    hh = max(seg_hi); hi = seg_hi.index(hh) + (last - n)
+    ll = min(seg_lo);  li = seg_lo.index(ll) + (last - n)
     if hi <= last - minbars and highs[last] >= hh:
         return +1
     if li <= last - minbars and lows[last]  <= ll:
@@ -139,7 +148,7 @@ class Trader:
     def _switch_one_way(self):
         try:
             rl_switch.wait()
-            self.client.switch_position_mode(category="linear", symbol=self.symbol, mode=0)
+            self.client.switch_position_mode(category=CATEGORY, symbol=self.symbol, mode=0)
             logging.info("[%s] position mode set One-Way", self.symbol)
         except InvalidRequestError as e:
             if "110025" in str(e):  # already one-way
@@ -152,7 +161,7 @@ class Trader:
     def _set_leverage(self):
         try:
             rl_lev.wait()
-            self.client.set_leverage(category="linear", symbol=self.symbol,
+            self.client.set_leverage(category=CATEGORY, symbol=self.symbol,
                                      buyLeverage=str(LEVERAGE_X), sellLeverage=str(LEVERAGE_X))
             logging.info("[%s] leverage set to %.1fx", self.symbol, LEVERAGE_X)
         except InvalidRequestError as e:
@@ -166,13 +175,13 @@ class Trader:
 
     def ticker(self) -> Tuple[float, float, float]:
         rl_misc.wait()
-        r = self.client.get_tickers(category="linear", symbol=self.symbol)
+        r = self.client.get_tickers(category=CATEGORY, symbol=self.symbol)
         px = float(r["result"]["list"][0]["lastPrice"])
         return (px, px, px)
 
     def klines_1h(self, limit: int = 200) -> List[List[float]]:
         rl_kline.wait()
-        r = self.client.get_kline(category="linear", symbol=self.symbol, interval="60", limit=limit)
+        r = self.client.get_kline(category=CATEGORY, symbol=self.symbol, interval="60", limit=limit)
         out: List[List[float]] = []
         for it in r["result"]["list"]:
             ts = int(it[0]); o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
@@ -200,14 +209,14 @@ class Trader:
         if qty <= 0:
             return
         rl_misc.wait()
-        self.client.place_order(category="linear", symbol=self.symbol, side=side,
+        self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
                                 orderType="Market", qty=str(qty),
                                 reduceOnly=reduce_only, timeInForce="IOC")
 
     def cancel_all_orders(self):
         try:
             rl_misc.wait()
-            self.client.cancel_all_orders(category="linear", symbol=self.symbol)
+            self.client.cancel_all_orders(category=CATEGORY, symbol=self.symbol)
         except Exception as e:
             logging.warning("[%s] cancel_all_orders failed: %s", self.symbol, e)
 
@@ -217,7 +226,7 @@ class Trader:
         rl_misc.wait()
         tif = "PostOnly" if post_only else "GoodTillCancel"
         try:
-            r = self.client.place_order(category="linear", symbol=self.symbol, side=side,
+            r = self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
                                         orderType="Limit", qty=str(qty), price=str(price),
                                         reduceOnly=reduce_only, timeInForce=tif)
             return r.get("result", {}).get("orderId")
@@ -396,7 +405,7 @@ class MultiBot:
     def _load_instruments(self) -> Dict[str, Dict[str, float]]:
         m: Dict[str, Dict[str, float]] = {}
         rl_misc.wait()
-        r = self.client.get_instruments_info(category="linear")
+        r = self.client.get_instruments_info(category=CATEGORY)
         for it in r["result"]["list"]:
             sym = it["symbol"].upper()
             lot = it.get("lotSizeFilter", {}) or {}
@@ -407,41 +416,38 @@ class MultiBot:
             m[sym] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
         return m
 
-    
-def _filter_live(self, symbols: List[str]) -> List[str]:
-    live: List[str] = []
-    for s in symbols:
-        try:
-            # 1) Try instrument status (linear)
-            rl_misc.wait()
-            r = self.client.get_instruments_info(category="linear", symbol=s)
-            lst = r.get("result", {}).get("list", [])
-            st  = str(lst[0].get("status", "")).lower() if lst else ""
-
-            if st in ("trading", "1", "live"):
-                live.append(s)
-                continue
-
-            # 2) Soft fallback: if kline returns data for linear, treat as live
+    def _filter_live(self, symbols: List[str]) -> List[str]:
+        live: List[str] = []
+        for s in symbols:
             try:
-                rl_kline.wait()
-                kr = self.client.get_kline(category="linear", symbol=s, interval="60", limit=2)
-                if kr.get("result", {}).get("list"):
+                # 1) Try instrument status on linear
+                rl_misc.wait()
+                r = self.client.get_instruments_info(category=CATEGORY, symbol=s)
+                lst = r.get("result", {}).get("list", [])
+                st  = str(lst[0].get("status", "")).lower() if lst else ""
+
+                if st in ("trading", "1", "live"):
                     live.append(s)
                     continue
-            except Exception:
-                pass
 
-            # 3) Not live (or unknown + no kline)
-            logging.error("[%s] contract not live (%s); skip", s, st or "unknown")
-        except Exception as e:
-            # API hiccup -> allow symbol; runtime will handle errors later
-            logging.warning("[%s] status check error: %s; allowing symbol", s, e)
-            live.append(s)
-    return live
+                # 2) Fallback: if kline returns data for linear, treat as live
+                try:
+                    rl_kline.wait()
+                    kr = self.client.get_kline(category=CATEGORY, symbol=s, interval="60", limit=2)
+                    if kr.get("result", {}).get("list"):
+                        live.append(s)
+                        continue
+                except Exception:
+                    pass
 
+                logging.error("[%s] contract not live (%s); skip", s, st or "unknown")
+            except Exception as e:
+                # API hiccup -> allow symbol; runtime will handle errors later
+                logging.warning("[%s] status check error: %s; allowing symbol", s, e)
+                live.append(s)
+        return live
 
-def total_exposure_usdt(self, sym_hint: Optional[str] = None, price_hint: Optional[float] = None) -> float:
+    def total_exposure_usdt(self, sym_hint: Optional[str] = None, price_hint: Optional[float] = None) -> float:
         total = 0.0
         for s, t in self.traders.items():
             if getattr(t, "_disabled", False) or t.dir == 0 or t.qty <= 0:
