@@ -1,26 +1,19 @@
-# bot_multi.py — Multi-symbol DCA bot for Bybit linear perp
-# Core rules (parity with 18.py, breakeven ignores fees):
-# - On each closed 1H bar: compute Lelec(50/30) signal s ∈ {-1,0,+1}.
-# - If Flat and s!=0: OPEN 1 leg in direction s.
-# - If In Position and s==dir and unrealized PnL<0: DCA one more leg.
-# - If Opposite signal:
-#     * if legs==1: CLOSE then immediately OPEN opposite (same bar).
-#     * if legs>1: only close&reverse when breakeven (PnL>=0).
-# - If No signal and legs>1 and breakeven: CLOSE now.
+# bot_multi.py — Multi-symbol DCA bot for Bybit linear perp (Render)
+# - Parity with 18.py (breakeven ignores fees)
+# - TP: maker-first (PostOnly + TTL) with market fallback
+# - SL: emergency market
+# - MAX_DCA default -1 (unlimited), Flip-on-profit, Geo-scaling, Cross-budget
+# - Throttled API calls; soft live filter with kline fallback
+# - Fail-fast when API keys missing
 #
-# Extras:
-# - MAX_DCA default -1 (unlimited). Flip-on-profit switch.
-# - Geo-scaling per leg (VOL_SCALE_LONG/SHORT).
-# - Cross-budget cap across all symbols.
-# - TP: maker-first (PostOnly) with TTL; fallback to market. SL: emergency market.
-# - Throttled API calls; filter non-live with kline fallback.
-# - Fail-fast if API keys missing.
-#
-import os, time, logging
+import os
+import time
+import logging
 from typing import List, Dict, Optional, Tuple
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 
+# ---------- ENV helpers ----------
 def env_str(name: str, default: str) -> str:
     v = os.getenv(name, default)
     return v if v is not None else default
@@ -37,6 +30,7 @@ def env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+# ---------- Config ----------
 BYBIT_API_KEY    = env_str("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = env_str("BYBIT_API_SECRET", "")
 CATEGORY         = "linear"
@@ -66,6 +60,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise SystemExit("BYBIT_API_KEY / BYBIT_API_SECRET are required but missing. Set them in Render → Environment.")
 
+# ---------- Utils ----------
 class RateLimiter:
     def __init__(self, min_interval_sec: float):
         self.min = float(min_interval_sec)
@@ -121,6 +116,7 @@ def lelec_signal_from_klines(kl: List[List[float]], n: int = 50, minbars: int = 
         return -1
     return 0
 
+# ---------- Trader ----------
 class Trader:
     def __init__(self, client: HTTP, symbol: str, inst_cfg: Dict[str, float], ctx: "MultiBot"):
         self.client = client
@@ -388,6 +384,7 @@ class Trader:
         self._switch_one_way()
         self._set_leverage()
 
+# ---------- MultiBot ----------
 class MultiBot:
     def __init__(self, symbols: List[str]):
         self.client = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=5000)
@@ -399,11 +396,12 @@ class MultiBot:
             t = Trader(self.client, s, cfg, ctx=self)
             t.init_on_exchange()
             self.traders[s] = t
-        logging.info("MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
-                     len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H)
+        logging.info(
+            "MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
+            len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H
+        )
 
-    
-def _load_instruments(self) -> Dict[str, Dict[str, float]]:
+    def _load_instruments(self) -> Dict[str, Dict[str, float]]:
         m: Dict[str, Dict[str, float]] = {}
         for s in self.symbols:
             try:
@@ -434,7 +432,6 @@ def _load_instruments(self) -> Dict[str, Dict[str, float]]:
                 logging.warning("[%s] instruments info error: %s; using defaults", s, e)
                 m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
         return m
-
 
     def _filter_live(self, symbols: List[str]) -> List[str]:
         live: List[str] = []
@@ -493,6 +490,7 @@ def _load_instruments(self) -> Dict[str, Dict[str, float]]:
                     logging.exception("[%s] step error: %s", s, e)
             time.sleep(POLL_SEC)
 
+# ---------- Main ----------
 if __name__ == "__main__":
     syms = read_pairs(PAIRS_FILE)
     if not syms:
