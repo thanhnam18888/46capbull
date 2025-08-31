@@ -1,10 +1,7 @@
 # bot_multi.py — Multi-symbol DCA bot for Bybit linear perp (Render)
-# - Parity with 18.py (breakeven ignores fees)
-# - TP: maker-first (PostOnly + TTL) with market fallback
-# - SL: emergency market
-# - MAX_DCA default -1 (unlimited), Flip-on-profit, Geo-scaling, Cross-budget
-# - Throttled API calls; soft live filter with kline fallback
-# - Fail-fast when API keys missing
+# Features: parity with 18.py, TP maker-first + TTL (fallback market), emergency SL,
+# MAX_DCA=-1 default, flip-on-profit, geo-scaling, cross-budget, soft live filter (kline fallback),
+# per-symbol lot filters, throttled API, fail-fast if keys missing, closed-candle signals only.
 #
 import os
 import time
@@ -39,8 +36,8 @@ LEG_USDT         = env_float("LEG_USDT", 15.0)
 PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
 POLL_SEC         = env_float("POLL_SEC", 2.5)
 
-TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
-FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)    # 0 by default
+TAKER_FEE        = env_float("TAKER_FEE", 0.0)
+FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)
 
 MAX_DCA          = env_int("MAX_DCA", -1)               # -1 = unlimited
 TP_PCT           = env_float("TP_PCT", 0.0)             # 0 = disabled
@@ -55,7 +52,18 @@ VOL_SCALE_SHORT  = env_float("VOL_SCALE_SHORT", 1.0)
 CROSS_BUDGET_USDT= env_float("CROSS_BUDGET_USDT", 0.0)  # 0 = disabled
 RESERVE_PCT      = env_float("RESERVE_PCT", 0.10)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+# Anti-spam logging controls
+LOG_LEVEL        = env_str("LOG_LEVEL", "INFO").upper()
+LOG_VERBOSE_INIT = env_int("LOG_VERBOSE_INIT", 0) == 1      # per-symbol init chatter
+LOG_THROTTLE_SEC = env_float("LOG_THROTTLE_SEC", 30.0)      # per-symbol error throttle
+
+_level_map = {
+    "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL
+}
+logging.basicConfig(level=_level_map.get(LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s: %(message)s")
+logging.getLogger().setLevel(_level_map.get(LOG_LEVEL, logging.INFO))
 
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise SystemExit("BYBIT_API_KEY / BYBIT_API_SECRET are required but missing. Set them in Render → Environment.")
@@ -94,7 +102,8 @@ def read_pairs(path: str) -> List[str]:
 def round_step(x: float, step: float) -> float:
     if step <= 0:
         return x
-    k = round(x / step)
+    # floor to nearest step to avoid exceeding max precision
+    k = int(x / step + 1e-12)
     v = k * step
     return v if v > 0 else step
 
@@ -145,10 +154,12 @@ class Trader:
         try:
             rl_switch.wait()
             self.client.switch_position_mode(category=CATEGORY, symbol=self.symbol, mode=0)
-            logging.info("[%s] position mode set One-Way", self.symbol)
+            if LOG_VERBOSE_INIT:
+                logging.info("[%s] position mode set One-Way", self.symbol)
         except InvalidRequestError as e:
-            if "110025" in str(e):  # already one-way
-                logging.debug("[%s] already One-Way", self.symbol)
+            if "110025" in str(e):
+                if LOG_VERBOSE_INIT:
+                    logging.debug("[%s] already One-Way", self.symbol)
             else:
                 logging.warning("[%s] switch mode failed: %s", self.symbol, e)
         except Exception as e:
@@ -159,9 +170,14 @@ class Trader:
             rl_lev.wait()
             self.client.set_leverage(category=CATEGORY, symbol=self.symbol,
                                      buyLeverage=str(LEVERAGE_X), sellLeverage=str(LEVERAGE_X))
-            logging.info("[%s] leverage set to %.1fx", self.symbol, LEVERAGE_X)
+            if LOG_VERBOSE_INIT:
+                logging.info("[%s] leverage set to %.1fx", self.symbol, LEVERAGE_X)
         except InvalidRequestError as e:
-            if "110074" in str(e):
+            msg = str(e)
+            if "110043" in msg:       # leverage not modified
+                if LOG_VERBOSE_INIT:
+                    logging.debug("[%s] leverage already %.1fx", self.symbol, LEVERAGE_X)
+            elif "110074" in msg:     # closed contract
                 logging.error("[%s] closed contract; disabling", self.symbol)
                 setattr(self, "_disabled", True)
             else:
@@ -214,7 +230,7 @@ class Trader:
             rl_misc.wait()
             self.client.cancel_all_orders(category=CATEGORY, symbol=self.symbol)
         except Exception as e:
-            logging.warning("[%s] cancel_all_orders failed: %s", self.symbol, e)
+            logging.debug("[%s] cancel_all_orders failed: %s", self.symbol, e)
 
     def place_limit(self, side: str, qty: float, price: float, reduce_only: bool = False, post_only: bool = False):
         if qty <= 0:
@@ -298,15 +314,17 @@ class Trader:
 
     def step(self):
         kl = self.klines_1h(limit=200)
-        if not kl or len(kl) < 60:
+        # Use only fully CLOSED bars: drop the newest bar which may be in-progress
+        if not kl or len(kl) < 61:
             logging.debug("[%s] insufficient klines; skip", self.symbol)
             return
-        last_ts = int(kl[-1][0])
+        kl_closed = kl[:-1]
+        last_ts = int(kl_closed[-1][0])
         if self.last_bar_ts == last_ts:
             return
         self.last_bar_ts = last_ts
 
-        sig = lelec_signal_from_klines(kl, n=50, minbars=30)
+        sig = lelec_signal_from_klines(kl_closed, n=50, minbars=30)
         _, _, price = self.ticker()
 
         self._funding_tick(price)
@@ -388,6 +406,8 @@ class Trader:
 class MultiBot:
     def __init__(self, symbols: List[str]):
         self.client = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=5000)
+        self._skipped: List[str] = []
+        self._err_gate: Dict[str, float] = {}
         self.symbols = self._filter_live(symbols)
         self.traders: Dict[str, Trader] = {}
         inst_map = self._load_instruments()
@@ -396,6 +416,12 @@ class MultiBot:
             t = Trader(self.client, s, cfg, ctx=self)
             t.init_on_exchange()
             self.traders[s] = t
+
+        if self._skipped:
+            preview = ", ".join(self._skipped[:20])
+            more = "" if len(self._skipped) <= 20 else f" (+{len(self._skipped)-20} more)"
+            logging.info("Skipped %d non-live symbols: %s%s", len(self._skipped), preview, more)
+
         logging.info(
             "MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
             len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H
@@ -409,7 +435,8 @@ class MultiBot:
                 r = self.client.get_instruments_info(category=CATEGORY, symbol=s)
                 lst = r.get("result", {}).get("list", [])
                 if not lst:
-                    logging.warning("[%s] instruments info empty; using defaults", s)
+                    if LOG_VERBOSE_INIT:
+                        logging.debug("[%s] instruments info empty; using defaults", s)
                     m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
                     continue
                 it = lst[0]
@@ -429,7 +456,8 @@ class MultiBot:
                     tick = 0.001
                 m[s] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
             except Exception as e:
-                logging.warning("[%s] instruments info error: %s; using defaults", s, e)
+                if LOG_VERBOSE_INIT:
+                    logging.debug("[%s] instruments info error: %s; using defaults", s, e)
                 m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
         return m
 
@@ -457,10 +485,9 @@ class MultiBot:
                 except Exception:
                     pass
 
-                logging.error("[%s] contract not live (%s); skip", s, st or "unknown")
-            except Exception as e:
+                self._skipped.append(s)
+            except Exception:
                 # API hiccup -> allow symbol; runtime will handle errors later
-                logging.warning("[%s] status check error: %s; allowing symbol", s, e)
                 live.append(s)
         return live
 
@@ -487,7 +514,15 @@ class MultiBot:
                 try:
                     t.step()
                 except Exception as e:
-                    logging.exception("[%s] step error: %s", s, e)
+                    now = time.time()
+                    last = self._err_gate.get(s, 0.0)
+                    if now - last >= LOG_THROTTLE_SEC:
+                        self._err_gate[s] = now
+                        logging.exception("[%s] step error: %s", s, e)
+                    else:
+                        # muted repeats
+                        msg = str(e).splitlines()[0]
+                        logging.warning("[%s] step error (muted): %s", s, msg)
             time.sleep(POLL_SEC)
 
 # ---------- Main ----------
