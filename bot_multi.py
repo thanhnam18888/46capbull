@@ -649,7 +649,7 @@ class MultiBot:
                     logging.warning("[BUDGET] equity fetch failed (eq=%.6f); keep dynamic_leg_usdt=%.6f", eq, self.dynamic_leg_usdt)
         except Exception as e:
             logging.warning("[BUDGET] update failed: %s", e)
-def loop(self):
+    def loop(self):
         # Align to next H1 close
         next_close = _next_bar_close()
         # Immediate bar-close pass on startup for quick testing (e.g., deploy at 04:20)
@@ -658,9 +658,6 @@ def loop(self):
             for _ in range(int(CLOSE_PASS_RETRIES)):
                 time.sleep(CLOSE_PASS_RETRY_GAP)
                 
-            # Update hourly budget 15s before bar close
-            self._update_hourly_budget_if_due(next_close)
-self._barclose_pass()
 
         while True:
             now = time.time()
@@ -669,6 +666,8 @@ self._barclose_pass()
                 time.sleep(min(IDLE_POLL_SEC, (next_close - now - 15.0)))
                 continue
 
+            # Update hourly budget 15s before bar close
+            self._update_hourly_budget_if_due(next_close)
             # Wait until just after close to ensure the last bar is finalized on the API
             if now < next_close + CLOSE_GRACE_SEC:
                 time.sleep(next_close + CLOSE_GRACE_SEC - now)
