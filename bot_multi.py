@@ -229,14 +229,29 @@ class Trader:
         return (px, px, px)
 
     def klines_1h(self, limit: int = 200) -> List[List[float]]:
-        rl_kline.wait()
-        r = self.client.get_kline(category=CATEGORY, symbol=self.symbol, interval="60", limit=limit)
-        out: List[List[float]] = []
-        for it in r["result"]["list"]:
-            ts = int(it[0]); o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
-            out.append([ts, o, h, l, c])
-        out.sort(key=lambda x: x[0])
-        return out
+        backoff = 0.4
+        for attempt in range(6):
+            try:
+                rl_kline.wait()
+                r = self.client.get_kline(category=CATEGORY, symbol=self.symbol, interval="60", limit=limit)
+                out: List[List[float]] = []
+                for it in r["result"]["list"]:
+                    ts = int(it[0]); o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
+                    out.append([ts, o, h, l, c])
+                out.sort(key=lambda x: x[0])
+                return out
+            except Exception as e:
+                msg = str(e).lower()
+                if "10006" in msg or "rate limit" in msg or "x-bapi-limit-reset-timestamp" in msg:
+                    time.sleep(backoff)
+                    backoff *= 1.6
+                    continue
+                if attempt < 2:
+                    time.sleep(backoff)
+                    backoff *= 1.6
+                    continue
+                raise
+        raise RuntimeError(f"[{self.symbol}] get_kline failed after retries (rate limit or network)")
 
     def _calc_leg_qty(self, price: float, dir_sign: int) -> float:
         idx = self.legs
@@ -244,6 +259,7 @@ class Trader:
         base_usdt = getattr(self.ctx, 'dynamic_leg_usdt', float(LEG_USDT)) or float(LEG_USDT)
         leg_usdt = base_usdt * (scale ** idx)
 
+        left = None
         if CROSS_BUDGET_USDT > 0.0:
             used = self.ctx.total_exposure_usdt(self.symbol, price_hint=price)
             left = CROSS_BUDGET_USDT * (1.0 - RESERVE_PCT) - used
@@ -251,8 +267,23 @@ class Trader:
                 return 0.0
             leg_usdt = min(leg_usdt, left)
 
+        if leg_usdt < MIN_NOTIONAL_USDT:
+            if CROSS_BUDGET_USDT > 0.0:
+                if left is not None and left < MIN_NOTIONAL_USDT:
+                    return 0.0
+                leg_usdt = min(max(MIN_NOTIONAL_USDT, leg_usdt), left if left is not None else MIN_NOTIONAL_USDT)
+            else:
+                leg_usdt = MIN_NOTIONAL_USDT
+
         qty = leg_usdt / price
         qty = round_step_floor(qty, self.qty_step)
+        if qty < self.min_qty:
+            qty = self.min_qty
+        if qty * price < MIN_NOTIONAL_USDT:
+            target_qty = round_step_floor(MIN_NOTIONAL_USDT / price, self.qty_step)
+            if CROSS_BUDGET_USDT > 0.0 and left is not None and target_qty * price > left:
+                return 0.0
+            qty = max(qty, target_qty)
         return max(qty, self.min_qty)
 
     def place_market(self, side: str, qty: float, reduce_only: bool = False):
@@ -367,12 +398,7 @@ class Trader:
         sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
 
         _, _, price = self.ticker()
-        
-        # ---- FAST PATH: auto-reverse immediately when NOT DCA'd yet (legs==1) and signal flips ----
-        try:
-            upnl = self.unreal_pnl(price)
-        except Exception:
-            upnl = 0.0
+        # ---- FAST PATH: auto-flip immediately when NOT DCA'd yet (legs==1) and signal flips ----
         if self.dir != 0 and self.legs == 1 and sig == -self.dir:
             if getattr(self, "tp_pending", False):
                 try:
@@ -484,11 +510,11 @@ class MultiBot:
             t = Trader(self.client, s, cfg, ctx=self)
             t.init_on_exchange()
             self.traders[s] = t
-
-        
         # Dynamic per-hour base leg notional (USDT), default to LEG_USDT
         self.dynamic_leg_usdt = float(LEG_USDT)
-        self._last_budget_hour = -1  # hour marker of last budget update
+        self._last_budget_hour = -1  # hour marker for budget update gating
+
+
         if self._skipped:
             preview = ", ".join(self._skipped[:20])
             more = "" if len(self._skipped) <= 20 else f" (+{len(self._skipped)-20} more)"
@@ -594,8 +620,6 @@ class MultiBot:
                 else:
                     msg = str(e).splitlines()[0]
                     logging.warning("[%s] step error (muted): %s", s, msg)
-
-    
     def _safe_get_equity_usdt(self) -> float:
         try:
             rl_misc.wait()
@@ -636,7 +660,7 @@ class MultiBot:
     def _update_hourly_budget_if_due(self, next_close_ts: int):
         try:
             now = int(time.time())
-            trigger_ts = int(next_close_ts) - 15  # hh:59:45
+            trigger_ts = int(next_close_ts) - 1800  # H:30:00
             hour_marker = int(next_close_ts // 3600)
             if now >= trigger_ts and self._last_budget_hour != hour_marker:
                 eq = self._safe_get_equity_usdt()
@@ -649,6 +673,8 @@ class MultiBot:
                     logging.warning("[BUDGET] equity fetch failed (eq=%.6f); keep dynamic_leg_usdt=%.6f", eq, self.dynamic_leg_usdt)
         except Exception as e:
             logging.warning("[BUDGET] update failed: %s", e)
+
+
     def loop(self):
         # Align to next H1 close
         next_close = _next_bar_close()
@@ -657,17 +683,17 @@ class MultiBot:
             self._barclose_pass()
             for _ in range(int(CLOSE_PASS_RETRIES)):
                 time.sleep(CLOSE_PASS_RETRY_GAP)
-                
+                self._barclose_pass()
 
         while True:
             now = time.time()
+            # Hourly budget update at H:30:00
+            self._update_hourly_budget_if_due(next_close)
             # Far from close -> idle sleep
             if now < next_close - 15.0:
                 time.sleep(min(IDLE_POLL_SEC, (next_close - now - 15.0)))
                 continue
 
-            # Update hourly budget 15s before bar close
-            self._update_hourly_budget_if_due(next_close)
             # Wait until just after close to ensure the last bar is finalized on the API
             if now < next_close + CLOSE_GRACE_SEC:
                 time.sleep(next_close + CLOSE_GRACE_SEC - now)
