@@ -241,7 +241,8 @@ class Trader:
     def _calc_leg_qty(self, price: float, dir_sign: int) -> float:
         idx = self.legs
         scale = VOL_SCALE_LONG if dir_sign > 0 else VOL_SCALE_SHORT
-        leg_usdt = LEG_USDT * (scale ** idx)
+        base_usdt = getattr(self.ctx, 'dynamic_leg_usdt', float(LEG_USDT)) or float(LEG_USDT)
+        leg_usdt = base_usdt * (scale ** idx)
 
         if CROSS_BUDGET_USDT > 0.0:
             used = self.ctx.total_exposure_usdt(self.symbol, price_hint=price)
@@ -366,6 +367,26 @@ class Trader:
         sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
 
         _, _, price = self.ticker()
+        
+        # ---- FAST PATH: auto-reverse immediately when NOT DCA'd yet (legs==1) and signal flips ----
+        try:
+            upnl = self.unreal_pnl(price)
+        except Exception:
+            upnl = 0.0
+        if self.dir != 0 and self.legs == 1 and sig == -self.dir:
+            if getattr(self, "tp_pending", False):
+                try:
+                    self.cancel_all_orders()
+                except Exception:
+                    pass
+                self.tp_pending = False
+                self.tp_px = None
+                self.tp_deadline = 0.0
+            self.close_all(price)
+            self.open_leg(-self.dir, price)
+            return
+        # --------------------------------------------------------------------
+
 
         self._funding_tick(price)
 
@@ -464,7 +485,11 @@ class MultiBot:
             t.init_on_exchange()
             self.traders[s] = t
 
-        if self._skipped:
+        
+        # Dynamic per-hour base leg notional (USDT), default to LEG_USDT
+        self.dynamic_leg_usdt = float(LEG_USDT)
+        self._last_budget_hour = -1  # hour marker of last budget update
+if self._skipped:
             preview = ", ".join(self._skipped[:20])
             more = "" if len(self._skipped) <= 20 else f" (+{len(self._skipped)-20} more)"
             logging.info("Skipped %d non-live symbols: %s%s", len(self._skipped), preview, more)
@@ -570,7 +595,61 @@ class MultiBot:
                     msg = str(e).splitlines()[0]
                     logging.warning("[%s] step error (muted): %s", s, msg)
 
-    def loop(self):
+    
+    def _safe_get_equity_usdt(self) -> float:
+        try:
+            rl_misc.wait()
+            r = self.client.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            lst = (r.get("result", {}) or {}).get("list", []) or []
+            if lst:
+                coins = (lst[0].get("coin", []) or [])
+                if coins:
+                    c0 = coins[0]
+                    for key in ("equity","walletBalance","availableToWithdraw","availableBalance"):
+                        v = c0.get(key)
+                        if v is not None:
+                            try:
+                                return float(v)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        try:
+            rl_misc.wait()
+            r = self.client.get_wallet_balance(accountType="CONTRACT", coin="USDT")
+            lst = (r.get("result", {}) or {}).get("list", []) or []
+            if lst:
+                coins = (lst[0].get("coin", []) or [])
+                if coins:
+                    c0 = coins[0]
+                    for key in ("equity","walletBalance","availableToWithdraw","availableBalance"):
+                        v = c0.get(key)
+                        if v is not None:
+                            try:
+                                return float(v)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        return 0.0
+
+    def _update_hourly_budget_if_due(self, next_close_ts: int):
+        try:
+            now = int(time.time())
+            trigger_ts = int(next_close_ts) - 15  # hh:59:45
+            hour_marker = int(next_close_ts // 3600)
+            if now >= trigger_ts and self._last_budget_hour != hour_marker:
+                eq = self._safe_get_equity_usdt()
+                if eq > 0.0:
+                    self.dynamic_leg_usdt = max(round(eq / 120.0, 6), 1e-6)
+                    self._last_budget_hour = hour_marker
+                    logging.info("[BUDGET] equity=%.6f → dynamic_leg_usdt=%.6f (hour=%d)", eq, self.dynamic_leg_usdt, hour_marker)
+                else:
+                    self._last_budget_hour = hour_marker
+                    logging.warning("[BUDGET] equity fetch failed (eq=%.6f); keep dynamic_leg_usdt=%.6f", eq, self.dynamic_leg_usdt)
+        except Exception as e:
+            logging.warning("[BUDGET] update failed: %s", e)
+def loop(self):
         # Align to next H1 close
         next_close = _next_bar_close()
         # Immediate bar-close pass on startup for quick testing (e.g., deploy at 04:20)
@@ -578,7 +657,10 @@ class MultiBot:
             self._barclose_pass()
             for _ in range(int(CLOSE_PASS_RETRIES)):
                 time.sleep(CLOSE_PASS_RETRY_GAP)
-                self._barclose_pass()
+                
+            # Update hourly budget 15s before bar close
+            self._update_hourly_budget_if_due(next_close)
+self._barclose_pass()
 
         while True:
             now = time.time()
