@@ -167,22 +167,6 @@ def bulls_signal_from_klines_barclose(klines: List[List[float]]) -> List[int]:
 # ---------- Trader ----------
 class Trader:
     def __init__(self, client: HTTP, symbol: str, inst_cfg: Dict[str, float], ctx: "MultiBot"):
-    def _format_qty_for_exchange(self, qty: float) -> str:
-        """Format qty to exchange lot step using Decimal to avoid float tails."""
-        from decimal import Decimal, ROUND_DOWN
-        step = Decimal(str(self.qty_step))
-        q = (Decimal(str(qty)) // step) * step  # floor to step
-        if q <= 0:
-            q = step
-        # Enforce minQty
-        min_q = Decimal(str(self.min_qty))
-        if q < min_q:
-            n = (min_q / step).to_integral_value(rounding=ROUND_DOWN)
-            q = n * step
-            if q < min_q:
-                q = min_q
-        return format(q.normalize(), 'f')
-
         self.client = client
         self.symbol = symbol
         self.ctx = ctx
@@ -219,6 +203,22 @@ class Trader:
                 logging.warning("[%s] switch mode failed: %s", self.symbol, e)
         except Exception as e:
             logging.warning("[%s] switch mode failed: %s", self.symbol, e)
+
+    def _format_qty_for_exchange(self, qty: float) -> str:
+        """Format qty to exchange lot step using Decimal to avoid float tails."""
+        from decimal import Decimal, ROUND_DOWN
+        step = Decimal(str(self.qty_step))
+        q = (Decimal(str(qty)) // step) * step  # floor to step
+        if q <= 0:
+            q = step
+        # Enforce minQty
+        min_q = Decimal(str(self.min_qty))
+        if q < min_q:
+            n = (min_q / step).to_integral_value(rounding=ROUND_DOWN)
+            q = n * step
+            if q < min_q:
+                q = min_q
+        return format(q.normalize(), 'f')
 
     def _set_leverage(self):
         try:
