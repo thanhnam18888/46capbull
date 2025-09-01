@@ -167,6 +167,22 @@ def bulls_signal_from_klines_barclose(klines: List[List[float]]) -> List[int]:
 # ---------- Trader ----------
 class Trader:
     def __init__(self, client: HTTP, symbol: str, inst_cfg: Dict[str, float], ctx: "MultiBot"):
+    def _format_qty_for_exchange(self, qty: float) -> str:
+        """Format qty to exchange lot step using Decimal to avoid float tails."""
+        from decimal import Decimal, ROUND_DOWN
+        step = Decimal(str(self.qty_step))
+        q = (Decimal(str(qty)) // step) * step  # floor to step
+        if q <= 0:
+            q = step
+        # Enforce minQty
+        min_q = Decimal(str(self.min_qty))
+        if q < min_q:
+            n = (min_q / step).to_integral_value(rounding=ROUND_DOWN)
+            q = n * step
+            if q < min_q:
+                q = min_q
+        return format(q.normalize(), 'f')
+
         self.client = client
         self.symbol = symbol
         self.ctx = ctx
@@ -293,7 +309,7 @@ class Trader:
             return
         rl_misc.wait()
         self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
-                                orderType="Market", qty=str(qty),
+                                orderType="Market", qty=self._format_qty_for_exchange(qty),
                                 reduceOnly=reduce_only, timeInForce="IOC")
 
     def cancel_all_orders(self):
@@ -310,7 +326,7 @@ class Trader:
         tif = "PostOnly" if post_only else "GoodTillCancel"
         try:
             r = self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
-                                        orderType="Limit", qty=str(qty), price=str(price),
+                                        orderType="Limit", qty=self._format_qty_for_exchange(qty), price=str(price),
                                         reduceOnly=reduce_only, timeInForce=tif)
             return r.get("result", {}).get("orderId")
         except Exception as e:
