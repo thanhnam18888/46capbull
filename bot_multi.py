@@ -489,7 +489,7 @@ class MultiBot:
         # Dynamic per-hour base leg notional (USDT), default to LEG_USDT
         self.dynamic_leg_usdt = float(LEG_USDT)
         self._last_budget_hour = -1  # hour marker of last budget update
-if self._skipped:
+        if self._skipped:
             preview = ", ".join(self._skipped[:20])
             more = "" if len(self._skipped) <= 20 else f" (+{len(self._skipped)-20} more)"
             logging.info("Skipped %d non-live symbols: %s%s", len(self._skipped), preview, more)
