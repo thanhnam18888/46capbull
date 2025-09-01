@@ -59,6 +59,8 @@ VOL_SCALE_SHORT  = env_float("VOL_SCALE_SHORT", 1.0)
 CROSS_BUDGET_USDT= env_float("CROSS_BUDGET_USDT", 0.0)  # 0 = disabled
 RESERVE_PCT      = env_float("RESERVE_PCT", 0.10)
 
+
+MIN_NOTIONAL_USDT = env_float("MIN_NOTIONAL_USDT", 5.0)
 # Anti-spam logging controls
 LOG_LEVEL        = env_str("LOG_LEVEL", "INFO").upper()
 LOG_VERBOSE_INIT = env_int("LOG_VERBOSE_INIT", 0) == 1      # per-symbol init chatter
