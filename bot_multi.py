@@ -521,7 +521,16 @@ class MultiBot:
             logging.info("Skipped %d non-live symbols: %s%s", len(self._skipped), preview, more)
 
         logging.info(
-            "MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
+            "
+        # Startup: compute hourly base leg now (no need to wait for H:30 on first run)
+        try:
+            eq0 = self._safe_get_equity_usdt()
+            if eq0 > 0.0:
+                self.dynamic_leg_usdt = max(round(eq0 / 120.0, 6), 1e-6)
+                logging.info("[BUDGET] (startup) equity=%.6f → dynamic_leg_usdt=%.6f", eq0, self.dynamic_leg_usdt)
+        except Exception as e:
+            logging.warning("[BUDGET] startup update failed: %s", e)
+MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
             len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H
         )
 
