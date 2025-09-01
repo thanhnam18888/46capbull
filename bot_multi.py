@@ -299,7 +299,8 @@ class Trader:
         if qty < self.min_qty:
             qty = self.min_qty
         if qty * price < MIN_NOTIONAL_USDT:
-            target_qty = round_step_floor(MIN_NOTIONAL_USDT / price, self.qty_step)
+                        from math import ceil
+            target_qty = ceil(MIN_NOTIONAL_USDT / price / self.qty_step) * self.qty_step
             if CROSS_BUDGET_USDT > 0.0 and left is not None and target_qty * price > left:
                 return 0.0
             qty = max(qty, target_qty)
