@@ -311,11 +311,11 @@ class Trader:
         rl_misc.wait()
         try:
             self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
-                                orderType="Market", qty=self._format_qty_for_exchange(qty),
-                                reduceOnly=reduce_only, timeInForce="IOC")
+                                    orderType="Market", qty=self._format_qty_for_exchange(qty),
+                                    reduceOnly=reduce_only, timeInForce="IOC")
         except Exception as e:
             msg = str(e).lower()
-            if "symbol is not supported" in msg or "instrument" in msg and "not" in msg and "support" in msg or "errcode: 10001" in msg:
+            if "symbol is not supported" in msg or ("instrument" in msg and "not" in msg and "support" in msg) or "errcode: 10001" in msg:
                 logging.error("[%s] exchange rejected symbol as unsupported; disabling further trading.", self.symbol)
                 self.disabled = True
                 return
@@ -334,12 +334,16 @@ class Trader:
         rl_misc.wait()
         tif = "PostOnly" if post_only else "GoodTillCancel"
         try:
-            r = try:
-            self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
+            r = self.client.place_order(category=CATEGORY, symbol=self.symbol, side=side,
                                         orderType="Limit", qty=self._format_qty_for_exchange(qty), price=str(price),
                                         reduceOnly=reduce_only, timeInForce=tif)
-            return r.get("result", {}).get("orderId")
+            return (r.get("result", {}) or {}).get("orderId")
         except Exception as e:
+            msg = str(e).lower()
+            if "symbol is not supported" in msg or ("instrument" in msg and "not" in msg and "support" in msg) or "errcode: 10001" in msg:
+                logging.error("[%s] exchange rejected symbol as unsupported; disabling further trading.", self.symbol)
+                self.disabled = True
+                return None
             logging.warning("[%s] place_limit failed: %s", self.symbol, e)
             return None
 
