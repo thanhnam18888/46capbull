@@ -56,7 +56,7 @@ def _compute_counters_at_hour_start(kl_closed: List[List[float]]) -> tuple[int, 
             sindex = 0
     return bindex, sindex, highest, lowest
 
-def _fetch_m1_last60(client: HTTP, symbol: str) -> List[List[float]]:
+def _fetch_m1_last60(client, symbol: str) -> List[List[float]]:
     # Pull the latest 60 M1 bars (enough to cover one hour). Use rate limiter rl_kline.
     try:
         rl_kline.wait()
@@ -74,7 +74,7 @@ def _fetch_m1_last60(client: HTTP, symbol: str) -> List[List[float]]:
     except Exception:
         return []
 
-def intrabar_signal_current_hour(client: HTTP, symbol: str, kl: List[List[float]], kl_closed: List[List[float]]) -> int:
+def intrabar_signal_current_hour(client, symbol: str, kl: List[List[float]], kl_closed: List[List[float]]) -> int:
     # Return intrabar Lelec signal for the CURRENT forming H1 bar using M1 inside the hour: +1 LONG, -1 SHORT, 0 none.
     if not kl or not kl_closed or len(kl_closed) < 55:
         return 0
