@@ -1,18 +1,23 @@
 
-# bot_multi_rlfix.py — Multi-symbol DCA bot for Bybit linear perp (Render)
-# Changelog vs your current bot_multi.py:
-# - Heavy rate-limit mitigation (slower kline cadence; no blanket tickers)
-# - Lazy ticker: only fetch live price right before an order is placed
-# - Use last CLOSED H1 close for decisions (no per-symbol ticker spam)
-# - Lower kline payload (limit=70) and fewer close-pass retries (default 0)
-# - Safer hourly budget: exposure computed from last_close or avg (no ticker)
-# - Removed duplicate stray functions at EOF
+# bot_multi_combined.py — Multi-symbol DCA bot for Bybit linear perp (Render)
+# Combines:
+#   (A) Full rate-limit mitigations to avoid ErrCode: 10006 bursts
+#   (B) Per-leg notional target = (equity/120) * leverage (your 1/120 then x5)
 #
-# Environment knobs you can tweak without code changes:
-#   RL_KLINE_SEC=0.35  (kline calls ~3/s) | RL_MISC_SEC=0.12 | RL_LEV_SEC=0.3 | RL_SWITCH_SEC=0.3
-#   CLOSE_PASS_RETRIES=0  (avoid extra bursts after close)
-#   KLINE_LIMIT=70  (must be >= 61 to satisfy signal)
-#   STARTUP_PASS=1
+# Highlights:
+# - Bar-close logic (H1) same as before (18.py style).
+# - Lazy ticker: only fetch live price right before placing an actual order.
+# - Kline cadence slowed via RL_KLINE_SEC (default 0.35s) + exponential backoff on 10006.
+# - No automatic "close-pass" retries by default (CLOSE_PASS_RETRIES=0) to avoid bursts after close.
+# - Reduced kline payload (KLINE_LIMIT=70) – still >= 61 bars for signal.
+# - Hourly dynamic leg uses leverage: dynamic_leg_usdt = (equity / 120) * LEVERAGE_X
+# - Budget/exposure computed from last_close/avg when possible (avoid ticker-spam).
+#
+# Env knobs (set in Render → Environment):
+#   RL_KLINE_SEC=0.35 | RL_MISC_SEC=0.12 | RL_LEV_SEC=0.30 | RL_SWITCH_SEC=0.30
+#   CLOSE_PASS_RETRIES=0 | KLINE_LIMIT=70 | STARTUP_PASS=1
+#   LEVERAGE_X=5.0 | LEG_USDT=15.0 (legacy default; not used if dynamic_leg_usdt set)
+#   MIN_NOTIONAL_USDT=5.0 | TP/SL/others same as your prior bot
 #
 import os
 import time
@@ -43,7 +48,7 @@ BYBIT_API_KEY    = env_str("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = env_str("BYBIT_API_SECRET", "")
 CATEGORY         = "linear"
 LEVERAGE_X       = env_float("LEVERAGE_X", 5.0)
-LEG_USDT         = env_float("LEG_USDT", 15.0)
+LEG_USDT         = env_float("LEG_USDT", 15.0)  # used as fallback if equity lookup fails
 PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
 
 TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
@@ -72,7 +77,7 @@ LOG_THROTTLE_SEC = env_float("LOG_THROTTLE_SEC", 30.0)
 # Bar-close scheduler
 BARFRAME_SEC              = env_float("BARFRAME_SEC", 3600.0)
 CLOSE_GRACE_SEC           = env_float("CLOSE_GRACE_SEC", 2.0)
-CLOSE_PASS_RETRIES        = env_int("CLOSE_PASS_RETRIES", 0)    # fewer bursts
+CLOSE_PASS_RETRIES        = env_int("CLOSE_PASS_RETRIES", 0)    # default 0 to avoid bursts
 CLOSE_PASS_RETRY_GAP      = env_float("CLOSE_PASS_RETRY_GAP", 1.5)
 IDLE_POLL_SEC             = env_float("IDLE_POLL_SEC", 10.0)
 STARTUP_PASS              = env_int("STARTUP_PASS", 1)
@@ -576,12 +581,12 @@ class MultiBot:
         logging.info("MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
                      len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H)
 
-        # Startup: compute hourly base leg now
+        # Startup: compute hourly base leg now (with leverage)
         try:
             eq0 = self._safe_get_equity_usdt()
             if eq0 > 0.0:
-                self.dynamic_leg_usdt = max(round(eq0 / 120.0, 6), 1e-6)
-                logging.info("[BUDGET] (startup) equity=%.6f → dynamic_leg_usdt=%.6f", eq0, self.dynamic_leg_usdt)
+                self.dynamic_leg_usdt = max(round((eq0 / 120.0) * LEVERAGE_X, 6), 1e-6)
+                logging.info("[BUDGET] (startup) equity=%.6f → dynamic_leg_usdt=%.6f (with leverage %.1fx)", eq0, self.dynamic_leg_usdt, LEVERAGE_X)
         except Exception as e:
             logging.warning("[BUDGET] startup update failed: %s", e)
 
@@ -660,22 +665,6 @@ class MultiBot:
             total += abs(t.qty * price)
         return total
 
-    def _barclose_pass(self):
-        for s, t in list(self.traders.items()):
-            if getattr(t, "_disabled", False):
-                continue
-            try:
-                t.step()
-            except Exception as e:
-                now = time.time()
-                last = self._err_gate.get(s, 0.0)
-                if now - last >= LOG_THROTTLE_SEC:
-                    self._err_gate[s] = now
-                    logging.exception("[%s] step error: %s", s, e)
-                else:
-                    msg = str(e).splitlines()[0]
-                    logging.warning("[%s] step error (muted): %s", s, msg)
-
     def _safe_get_equity_usdt(self) -> float:
         # Try UNIFIED then CONTRACT without raising
         try:
@@ -722,14 +711,30 @@ class MultiBot:
             if now >= trigger_ts and self._last_budget_hour != hour_marker:
                 eq = self._safe_get_equity_usdt()
                 if eq > 0.0:
-                    self.dynamic_leg_usdt = max(round(eq / 120.0, 6), 1e-6)
+                    self.dynamic_leg_usdt = max(round((eq / 120.0) * LEVERAGE_X, 6), 1e-6)
                     self._last_budget_hour = hour_marker
-                    logging.info("[BUDGET] equity=%.6f → dynamic_leg_usdt=%.6f (hour=%d)", eq, self.dynamic_leg_usdt, hour_marker)
+                    logging.info("[BUDGET] equity=%.6f → dynamic_leg_usdt=%.6f (hour=%d, with leverage %.1fx)", eq, self.dynamic_leg_usdt, hour_marker, LEVERAGE_X)
                 else:
                     self._last_budget_hour = hour_marker
                     logging.warning("[BUDGET] equity fetch failed (eq=%.6f); keep dynamic_leg_usdt=%.6f", eq, self.dynamic_leg_usdt)
         except Exception as e:
             logging.warning("[BUDGET] update failed: %s", e)
+
+    def _barclose_pass(self):
+        for s, t in list(self.traders.items()):
+            if getattr(t, "_disabled", False):
+                continue
+            try:
+                t.step()
+            except Exception as e:
+                now = time.time()
+                last = self._err_gate.get(s, 0.0)
+                if now - last >= LOG_THROTTLE_SEC:
+                    self._err_gate[s] = now
+                    logging.exception("[%s] step error: %s", s, e)
+                else:
+                    msg = str(e).splitlines()[0]
+                    logging.warning("[%s] step error (muted): %s", s, msg)
 
     def loop(self):
         next_close = _next_bar_close()
