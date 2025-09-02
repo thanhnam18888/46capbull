@@ -23,103 +23,6 @@ import os
 import time
 import logging
 from typing import List, Dict, Optional, Tuple
-
-# --- Intrabar helpers (M1-based) ---
-def _compute_counters_at_hour_start(kl_closed: List[List[float]]) -> tuple[int, int, List[float], List[float]]:
-    # Compute bindex/sindex just before current hour, with bar-close resets across closed bars.
-    # Also return arrays highest50 and lowest50 for closed bars to reuse quickly.
-    n = len(kl_closed)
-    o = [float(x[1]) for x in kl_closed]
-    h = [float(x[2]) for x in kl_closed]
-    l = [float(x[3]) for x in kl_closed]
-    c = [float(x[4]) for x in kl_closed]
-    length = 50
-    bars_thr = 30
-    highest = [0.0]*n
-    lowest  = [0.0]*n
-    for i in range(n):
-        lo = max(0, i - length + 1)
-        hi = i + 1
-        highest[i] = max(h[lo:hi])
-        lowest[i]  = min(l[lo:hi])
-    bindex = 0; sindex = 0
-    for i in range(n):
-        if i >= 4 and c[i] > c[i-4]:
-            bindex += 1
-        if i >= 4 and c[i] < c[i-4]:
-            sindex += 1
-        condShort = (bindex > bars_thr) and (c[i] < o[i]) and (h[i] >= highest[i])
-        condLong  = (sindex > bars_thr) and (c[i] > o[i]) and (l[i] <= lowest[i])
-        if condShort:
-            bindex = 0
-        elif condLong:
-            sindex = 0
-    return bindex, sindex, highest, lowest
-
-def _fetch_m1_last60(client, symbol: str) -> List[List[float]]:
-    # Pull the latest 60 M1 bars (enough to cover one hour). Use rate limiter rl_kline.
-    try:
-        rl_kline.wait()
-        r = client.get_kline(category=CATEGORY, symbol=symbol, interval="1", limit=60)
-        lst = (((r or {}).get("result") or {}).get("list") or [])
-        out: List[List[float]] = []
-        for it in lst:
-            try:
-                ts = int(it[0]); o = float(it[1]); h = float(it[2]); lo = float(it[3]); c = float(it[4])
-                out.append([ts, o, h, lo, c])
-            except Exception:
-                continue
-        out.sort(key=lambda x: x[0])
-        return out
-    except Exception:
-        return []
-
-def intrabar_signal_current_hour(client, symbol: str, kl: List[List[float]], kl_closed: List[List[float]]) -> int:
-    # Return intrabar Lelec signal for the CURRENT forming H1 bar using M1 inside the hour: +1 LONG, -1 SHORT, 0 none.
-    if not kl or not kl_closed or len(kl_closed) < 55:
-        return 0
-    curr = kl[-1]               # potentially-forming bar
-    hour_start = int(curr[0])
-    hour_open  = float(curr[1])
-    # Previous 49 extremes from closed bars (exclude current)
-    prev = kl_closed
-    n = len(prev)
-    lo = max(0, n - 49)
-    prev49_high = max(float(x[2]) for x in prev[lo:]) if n > 0 else hour_open
-    prev49_low  = min(float(x[3]) for x in prev[lo:]) if n > 0 else hour_open
-    # Base counters at hour start
-    bidx, sidx, _, _ = _compute_counters_at_hour_start(prev)
-    # close[4] from H1 i-4 (use last 4th closed)
-    close_m4 = float(prev[-4][4])
-
-    # Fetch M1 for last hour and filter to current hour
-    m1 = _fetch_m1_last60(client, symbol)
-    if not m1:
-        return 0
-    m1 = [x for x in m1 if int(x[0]) >= hour_start]
-
-    high_so_far = hour_open
-    low_so_far  = hour_open
-    last_sig = 0
-    for mb in m1:
-        px = float(mb[4])
-        if mb[2] > high_so_far: high_so_far = float(mb[2])
-        if mb[3] < low_so_far:  low_so_far  = float(mb[3])
-        if px > close_m4:
-            bidx += 1
-        elif px < close_m4:
-            sidx += 1
-        roll_highest_50 = prev49_high if prev49_high >= high_so_far else high_so_far
-        roll_lowest_50  = prev49_low  if prev49_low  <= low_so_far  else low_so_far
-        condShort = (bidx > 30) and (px < hour_open) and (high_so_far >= roll_highest_50)
-        if condShort:
-            last_sig = -1
-            bidx = 0
-        condLong  = (sidx > 30) and (px > hour_open) and (low_so_far <= roll_lowest_50)
-        if condLong:
-            last_sig = +1
-            sidx = 0
-    return last_sig
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 
@@ -172,9 +75,7 @@ LOG_VERBOSE_INIT = env_int("LOG_VERBOSE_INIT", 0) == 1
 LOG_THROTTLE_SEC = env_float("LOG_THROTTLE_SEC", 30.0)
 
 # Bar-close scheduler
-INTRABAR_MODE          = env_int("INTRABAR_MODE", 1)
-INTRABAR_POLL_SEC      = env_float("INTRABAR_POLL_SEC", 30.0)
-BARFRAME_SEC              = env_float("BARFRAME_SEC", 60.0 if INTRABAR_MODE else 3600.0)
+BARFRAME_SEC              = env_float("BARFRAME_SEC", 3600.0)
 CLOSE_GRACE_SEC           = env_float("CLOSE_GRACE_SEC", 2.0)
 CLOSE_PASS_RETRIES        = env_int("CLOSE_PASS_RETRIES", 0)    # default 0 to avoid bursts
 CLOSE_PASS_RETRY_GAP      = env_float("CLOSE_PASS_RETRY_GAP", 1.5)
@@ -547,20 +448,14 @@ class Trader:
             logging.debug("[%s] insufficient klines; skip", self.symbol)
             return
         kl_closed = kl[:-1]  # drop potentially in-progress
-        if INTRABAR_MODE:
-            now_minute = int(time.time() // 60)
-            if getattr(self, '_last_minute_marker', None) == now_minute:
-                return
-            self._last_minute_marker = now_minute
-        else:
-            last_ts = int(kl_closed[-1][0])
-            if getattr(self, 'last_bar_ts', None) == last_ts:
-                return
-            self.last_bar_ts = last_ts
+        last_ts = int(kl_closed[-1][0])
+        if self.last_bar_ts == last_ts:
+            return
+        self.last_bar_ts = last_ts
         self.last_close = float(kl_closed[-1][4])
 
         # 18.py signal
-        sig = intrabar_signal_current_hour(self.client, self.symbol, kl, kl_closed) if INTRABAR_MODE else bulls_signal_from_klines_barclose(kl_closed)[-1]
+        sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
 
         # Use bar-close price for decision; fetch live only when we actually trade
         price_ref = self.last_close
@@ -853,7 +748,7 @@ class MultiBot:
             now = time.time()
             self._update_hourly_budget_if_due(next_close)
 
-            if not INTRABAR_MODE and now < next_close - 15.0:
+            if now < next_close - 15.0:
                 time.sleep(min(IDLE_POLL_SEC, (next_close - now - 15.0)))
                 continue
 
