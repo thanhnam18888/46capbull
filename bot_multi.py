@@ -172,13 +172,13 @@ LOG_VERBOSE_INIT = env_int("LOG_VERBOSE_INIT", 0) == 1
 LOG_THROTTLE_SEC = env_float("LOG_THROTTLE_SEC", 30.0)
 
 # Bar-close scheduler
+INTRABAR_MODE          = env_int("INTRABAR_MODE", 1)
+INTRABAR_POLL_SEC      = env_float("INTRABAR_POLL_SEC", 30.0)
 BARFRAME_SEC              = env_float("BARFRAME_SEC", 60.0 if INTRABAR_MODE else 3600.0)
 CLOSE_GRACE_SEC           = env_float("CLOSE_GRACE_SEC", 2.0)
 CLOSE_PASS_RETRIES        = env_int("CLOSE_PASS_RETRIES", 0)    # default 0 to avoid bursts
 CLOSE_PASS_RETRY_GAP      = env_float("CLOSE_PASS_RETRY_GAP", 1.5)
 IDLE_POLL_SEC             = env_float("IDLE_POLL_SEC", 10.0)
-INTRABAR_MODE          = env_int("INTRABAR_MODE", 1)
-INTRABAR_POLL_SEC      = env_float("INTRABAR_POLL_SEC", 30.0)
 STARTUP_PASS              = env_int("STARTUP_PASS", 1)
 
 # Request pacing (account-wide)
