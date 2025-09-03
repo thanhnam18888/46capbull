@@ -217,6 +217,26 @@ class Trader:
         self.tp_deadline = 0.0
 
     # ---- exchange setup ----
+
+    def _format_qty_for_exchange(self, qty: float) -> str:
+        """Format quantity according to exchange step/min rules without changing strategy logic.
+        We keep the qty rounding consistent with compute_open_leg() using round_step_floor and enforce min_qty.
+        Returns a string to avoid scientific notation issues in HTTP client.
+        """
+        try:
+            q = float(qty)
+        except Exception:
+            q = 0.0
+        # apply step & min guard
+        q = max(self.min_qty, round_step_floor(q, self.qty_step))
+        # determine decimals from qty_step
+        step = float(self.qty_step)
+        if step >= 1 or step.is_integer():
+            return str(int(q))
+        # count decimals in step (e.g., 0.001 -> 3)
+        s = ("%0.16f" % step).rstrip('0').rstrip('.')
+        dec = len(s.split('.')[-1]) if '.' in s else 0
+        return f"{q:.{dec}f}"
     def _switch_one_way(self):
         try:
             rl_switch.wait()
@@ -799,3 +819,36 @@ if __name__ == "__main__":
     if not syms:
         raise SystemExit(f"No symbols loaded from {PAIRS_FILE}")
     MultiBot(syms).loop()
+# ================== BEGIN: minimal safe injection ==================
+# This block **does not change trading logic**. It only ensures that a tiny
+# helper exists for formatting qty per exchange step/min rules, in case
+# earlier patches referenced `self._format_qty_for_exchange(...)`.
+
+def __bulls__qtyfmt_helper(self, qty):
+    import math
+    try:
+        step = float(getattr(self, "qty_step", 0.001) or 0.001)
+        min_qty = float(getattr(self, "min_qty", step) or step)
+        q = max(min_qty, math.floor(float(qty) / step) * step)
+        # Determine decimals from step, e.g. 0.001 -> 3
+        try:
+            is_int_step = float(step).is_integer()
+        except Exception:
+            is_int_step = False
+        if step >= 1 or is_int_step:
+            return str(int(q))
+        s = ("%0.16f" % step).rstrip("0").rstrip(".")
+        dec = len(s.split(".")[-1]) if "." in s else 0
+        return f"{q:.{dec}f}"
+    except Exception:
+        # As a last resort, do not block order placement due to formatting
+        return str(qty)
+
+# Bind to class if missing (monkey-patch), without touching core code paths
+try:
+    if 'Trader' in globals() and not hasattr(Trader, "_format_qty_for_exchange"):
+        Trader._format_qty_for_exchange = __bulls__qtyfmt_helper
+except Exception:
+    # Never raise here
+    pass
+# =================== END: minimal safe injection ===================
