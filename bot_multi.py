@@ -21,8 +21,12 @@
 #
 import os
 import time
+try:
+    from datetime import datetime, UTC
+except Exception:
+    from datetime import datetime, timezone as _tz
+    UTC = _tz.utc
 import logging
-from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
@@ -120,7 +124,6 @@ rl_lev    = RateLimiter(RL_LEV_SEC)
 rl_kline  = RateLimiter(RL_KLINE_SEC)
 rl_misc   = RateLimiter(RL_MISC_SEC)
 
-
 def read_pairs(path: str) -> List[str]:
     if not os.path.exists(path):
         return []
@@ -130,11 +133,6 @@ def read_pairs(path: str) -> List[str]:
             s = line.strip().upper()
             if not s:
                 continue
-            # normalize common inputs:
-            # - drop trailing ".P"
-            if s.endswith(".P"):
-                s = s[:-2]
-            # - append USDT if missing
             if not s.endswith("USDT"):
                 s += "USDT"
             out.append(s)
@@ -458,19 +456,21 @@ class Trader:
         last_ts = int(kl_closed[-1][0])
         if self.last_bar_ts == last_ts:
             return
-        self.last_bar_ts = last_ts
         self.last_close = float(kl_closed[-1][4])
 
         # 18.py signal
         sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
-        # log when a signal appears for this closed bar (diagnostic)
+        # Mark processed bar timestamp after computing signal
+        self.last_bar_ts = last_ts
+        # Log signal at bar-close
         if sig != 0:
-            o, h, l, c = kl_closed[-1][1], kl_closed[-1][2], kl_closed[-1][3], kl_closed[-1][4]
+            o,h,l,c = kl_closed[-1][1:5]
+            try:
+                ts_str = datetime.fromtimestamp(self.last_bar_ts/1000, UTC).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts_str = str(self.last_bar_ts)
             logging.info("[%s] SIGNAL %s @ %sZ  O=%.6f H=%.6f L=%.6f C=%.6f",
-                         self.symbol, "LONG" if sig>0 else "SHORT",
-                         datetime.utcfromtimestamp(self.last_bar_ts).strftime("%Y-%m-%d %H:%M:%S"),
-                         o, h, l, c)
-
+                         self.symbol, "LONG" if sig>0 else "SHORT", ts_str, o, h, l, c)
 
         # Use bar-close price for decision; fetch live only when we actually trade
         price_ref = self.last_close
@@ -753,7 +753,10 @@ class MultiBot:
 
     def loop(self):
         next_close = _next_bar_close()
-        logging.info("[BAR] next close at %sZ", datetime.utcfromtimestamp(next_close).strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            logging.info("[BAR] next close at %sZ", datetime.fromtimestamp(next_close, UTC).strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
         if STARTUP_PASS:
             logging.info("[BAR] startup-pass (last closed)")
             self._barclose_pass()
@@ -773,8 +776,8 @@ class MultiBot:
             if now < next_close + CLOSE_GRACE_SEC:
                 time.sleep(next_close + CLOSE_GRACE_SEC - now)
 
+            logging.info("[BAR] running close-pass for %sZ", datetime.fromtimestamp(next_close, UTC).strftime("%Y-%m-%d %H:%M:%S"))
             # one pass (sequential; rate-limited internally)
-            logging.info("[BAR] running close-pass for %sZ", datetime.utcfromtimestamp(next_close).strftime("%Y-%m-%d %H:%M:%S"))
             self._barclose_pass()
             for _ in range(int(CLOSE_PASS_RETRIES)):
                 time.sleep(CLOSE_PASS_RETRY_GAP)
