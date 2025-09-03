@@ -181,6 +181,13 @@ def bulls_signal_from_klines_barclose(klines: List[List[float]]) -> List[int]:
 
     return lelex
 
+# helper to flip Bybit ".P" suffix (some markets require it for trading endpoints)
+def _toggle_p_suffix(sym: str) -> str:
+    try:
+        return sym[:-2] if sym.endswith(".P") else (sym + ".P")
+    except Exception:
+        return sym
+
 # ---------- Trader ----------
 class Trader:
     def __init__(self, client: HTTP, symbol: str, inst_cfg: Dict[str, float], ctx: "MultiBot"):
@@ -191,6 +198,7 @@ class Trader:
         self.qty_step = inst_cfg.get("qty_step", 0.001)
         self.min_qty  = inst_cfg.get("min_qty", 0.001)
         self.tick     = inst_cfg.get("tick", 0.001)
+        self._alt_tried = False  # retry once with toggled .P if unsupported
 
         self.dir = 0         # +1/-1/0
         self.qty = 0.0
@@ -271,27 +279,12 @@ class Trader:
                 raise
         raise RuntimeError(f"[{self.symbol}] get_kline failed after retries (rate limit or network)")
 
-    def _format_qty_for_exchange(self, qty: float) -> str:
-        from decimal import Decimal, ROUND_DOWN
-        step = Decimal(str(self.qty_step))
-        q = (Decimal(str(qty)) // step) * step  # floor to step
-        if q <= 0:
-            q = step
-        # Enforce minQty
-        min_q = Decimal(str(self.min_qty))
-        if q < min_q:
-            q = min_q
-        return format(q.normalize(), 'f')
-
-    def _upnl_from_price(self, px: float) -> float:
-        if self.dir == 0 or self.qty <= 0 or self.avg is None:
-            return 0.0
-        gross = (px / self.avg - 1.0) if self.dir > 0 else (1.0 - px / self.avg)
-        px_pnl = self.qty * self.avg * gross
-        exit_fee = self.qty * px * TAKER_FEE
-        return px_pnl - (self.entry_fees + exit_fee + self.funding_paid)
-
-    # ---- order helpers ----
+    def cancel_all_orders(self):
+        try:
+            rl_misc.wait()
+            self.client.cancel_all_orders(category=CATEGORY, symbol=self.symbol)
+        except Exception as e:
+            logging.debug("[%s] cancel_all_orders failed: %s", self.symbol, e)
     def place_market(self, side: str, qty: float, reduce_only: bool = False) -> bool:
         if qty <= 0:
             return False
@@ -303,12 +296,22 @@ class Trader:
             return True
         except Exception as e:
             msg = str(e).lower()
-            if "symbol is not supported" in msg or ("instrument" in msg and "not" in msg and "support" in msg) or "errcode: 10001" in msg:
+            unsupported = ("symbol is not supported" in msg) or (("instrument" in msg and "not" in msg and "support" in msg)) or ("errcode: 10001" in msg)
+            if unsupported:
+                if not getattr(self, "_alt_tried", False):
+                    alt = _toggle_p_suffix(self.symbol)
+                    logging.warning("[%s] unsupported; retrying as %s", self.symbol, alt)
+                    self._alt_tried = True
+                    self.symbol = alt
+                    self._switch_one_way()
+                    self._set_leverage()
+                    return self.place_market(side, qty, reduce_only)
                 logging.error("[%s] exchange rejected symbol as unsupported; disabling further trading.", self.symbol)
                 self.disabled = True
                 return False
             logging.warning("[%s] place_market failed: %s", self.symbol, e)
             return False
+
 
     def cancel_all_orders(self):
         try:
@@ -316,7 +319,6 @@ class Trader:
             self.client.cancel_all_orders(category=CATEGORY, symbol=self.symbol)
         except Exception as e:
             logging.debug("[%s] cancel_all_orders failed: %s", self.symbol, e)
-
     def place_limit(self, side: str, qty: float, price: float, reduce_only: bool = False, post_only: bool = False):
         if qty <= 0:
             return None
@@ -327,16 +329,26 @@ class Trader:
                                         orderType="Limit", qty=self._format_qty_for_exchange(qty), price=str(price),
                                         reduceOnly=reduce_only, timeInForce=tif)
             return (r.get("result", {}) or {}).get("orderId")
+
         except Exception as e:
             msg = str(e).lower()
-            if "symbol is not supported" in msg or ("instrument" in msg and "not" in msg and "support" in msg) or "errcode: 10001" in msg:
+            unsupported = ("symbol is not supported" in msg) or (("instrument" in msg and "not" in msg and "support" in msg)) or ("errcode: 10001" in msg)
+            if unsupported:
+                if not getattr(self, "_alt_tried", False):
+                    alt = _toggle_p_suffix(self.symbol)
+                    logging.warning("[%s] unsupported; retrying as %s", self.symbol, alt)
+                    self._alt_tried = True
+                    self.symbol = alt
+                    self._switch_one_way()
+                    self._set_leverage()
+                    return self.place_limit(side, qty, price, reduce_only, post_only)
                 logging.error("[%s] exchange rejected symbol as unsupported; disabling further trading.", self.symbol)
                 self.disabled = True
                 return None
             logging.warning("[%s] place_limit failed: %s", self.symbol, e)
             return None
 
-    # ---- position ops (use live price only when actually trading) ----
+
     def _fetch_live_price(self) -> float:
         # lightweight ticker (no caching); called sparingly
         rl_misc.wait()
@@ -583,9 +595,10 @@ class MultiBot:
         inst_map = self._load_instruments()
         for s in self.symbols:
             cfg = inst_map.get(s, {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001})
-            t = Trader(self.client, s, cfg, ctx=self)
+            sym = cfg.get("canonical", s)
+            t = Trader(self.client, sym, cfg, ctx=self)
             t.init_on_exchange()
-            self.traders[s] = t
+            self.traders[sym] = t
         self.dynamic_leg_usdt = float(LEG_USDT)
         self._last_budget_hour = -1  # hour marker
 
@@ -616,7 +629,7 @@ class MultiBot:
                 if not lst:
                     if LOG_VERBOSE_INIT:
                         logging.debug("[%s] instruments info empty; using defaults", s)
-                    m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
+                    m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": "", "canonical": s}
                     continue
                 it = lst[0]
                 lot = it.get("lotSizeFilter", {}) or {}
@@ -633,11 +646,11 @@ class MultiBot:
                     tick     = float(px.get("tickSize", "0.001"))
                 except Exception:
                     tick = 0.001
-                m[s] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
+                m[s] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", ""), "canonical": it.get("symbol", s)}
             except Exception as e:
                 if LOG_VERBOSE_INIT:
                     logging.debug("[%s] instruments info error: %s; using defaults", s, e)
-                m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
+                m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": "", "canonical": s}
         return m
 
     def _filter_live(self, symbols: List[str]) -> List[str]:
