@@ -447,7 +447,23 @@ class Trader:
         if not kl or len(kl) < 61:
             logging.debug("[%s] insufficient klines; skip", self.symbol)
             return
-        kl_closed = kl[:-1]  # drop potentially in-progress
+        # === BEGIN: closed-bar & ordering guard ===
+        try:
+            if len(kl) >= 2 and int(kl[0][0]) > int(kl[-1][0]):
+                kl = sorted(kl, key=lambda x: int(x[0]))
+        except Exception:
+            pass
+        try:
+            import time
+            BARFRAME_MS = 60 * 60 * 1000
+            _now_ms = int(time.time() * 1000)
+            while kl and int(kl[-1][0]) + BARFRAME_MS > _now_ms:
+                kl = kl[:-1]
+        except Exception:
+            pass
+        # === END: closed-bar & ordering guard ===
+
+        kl_closed = kl  # drop potentially in-progress
         last_ts = int(kl_closed[-1][0])
         if self.last_bar_ts == last_ts:
             return
