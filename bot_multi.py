@@ -9,13 +9,13 @@
 # - Lazy ticker: only fetch live price right before placing an actual order.
 # - Kline cadence slowed via RL_KLINE_SEC (default 0.35s) + exponential backoff on 10006.
 # - No automatic "close-pass" retries by default (CLOSE_PASS_RETRIES=0) to avoid bursts after close.
-# - Reduced kline payload (KLINE_LIMIT=70) – still >= 61 bars for signal.
+# - Reduced kline payload (KLINE_LIMIT=120) – still >= 61 bars for signal.
 # - Hourly dynamic leg uses leverage: dynamic_leg_usdt = (equity / 120) * LEVERAGE_X
 # - Budget/exposure computed from last_close/avg when possible (avoid ticker-spam).
 #
 # Env knobs (set in Render → Environment):
 #   RL_KLINE_SEC=0.35 | RL_MISC_SEC=0.12 | RL_LEV_SEC=0.30 | RL_SWITCH_SEC=0.30
-#   CLOSE_PASS_RETRIES=0 | KLINE_LIMIT=70 | STARTUP_PASS=1
+#   CLOSE_PASS_RETRIES=0 | KLINE_LIMIT=120 | STARTUP_PASS=1
 #   LEVERAGE_X=5.0 | LEG_USDT=15.0 (legacy default; not used if dynamic_leg_usdt set)
 #   MIN_NOTIONAL_USDT=5.0 | TP/SL/others same as your prior bot
 #
