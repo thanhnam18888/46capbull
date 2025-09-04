@@ -68,6 +68,9 @@ CROSS_BUDGET_USDT= env_float("CROSS_BUDGET_USDT", 0.0)  # 0 = disabled
 RESERVE_PCT      = env_float("RESERVE_PCT", 0.10)
 
 MIN_NOTIONAL_USDT = env_float("MIN_NOTIONAL_USDT", 5.0)
+# Entry confirm (optional; default 1)
+ENTRY_CONFIRM_BARS = int(os.getenv("ENTRY_CONFIRM_BARS", "1"))
+
 
 # Anti-spam logging controls
 LOG_LEVEL        = env_str("LOG_LEVEL", "INFO").upper()
@@ -470,9 +473,8 @@ class Trader:
         self.last_bar_ts = last_ts
         self.last_close = float(kl_closed[-1][4])
 
-        # 18.py signal array
-        sig_arr = bulls_signal_from_klines_barclose(kl_closed)
-        sig = sig_arr[-1]
+        # 18.py signal
+        sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
 
         # Use bar-close price for decision; fetch live only when we actually trade
         price_ref = self.last_close
@@ -535,18 +537,7 @@ class Trader:
 
         if self.dir == 0:
             if sig != 0:
-                ok_entry = True
-                if ENTRY_CONFIRM_BARS > 1:
-                    if len(sig_arr) >= ENTRY_CONFIRM_BARS:
-                        tail = sig_arr[-ENTRY_CONFIRM_BARS:]
-                        ok_entry = all(s == sig for s in tail)
-                    else:
-                        ok_entry = False
-                if ok_entry:
-                    self.open_leg(sig)
-                else:
-                    logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
-                                 self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
+                self.open_leg(sig)
             return
 
         upnl = self._upnl_from_price(price_ref)
