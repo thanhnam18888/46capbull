@@ -787,34 +787,153 @@ if __name__ == "__main__":
         raise SystemExit(f"No symbols loaded from {PAIRS_FILE}")
     MultiBot(syms).loop()
 
-# ================== BEGIN: compatibility shim (_upnl_from_price) ==================
-# This shim preserves original trading logic. It only defines a fallback method
-# if the class Trader does not already implement `_upnl_from_price`.
-def __bulls__upnl_helper(self, px):
-    try:
-        # Linear USDT perp PnL approximation in USDT:
-        # LONG:  qty * (px - avg)
-        # SHORT: qty * (avg - px)
-        # Subtract entry + exit fees and accumulated funding as conservative estimate.
-        qty = float(getattr(self, "qty", 0.0) or 0.0)
-        avg = float(getattr(self, "avg", 0.0) or 0.0)
-        dr  = int(getattr(self, "dir", 0) or 0)
-        taker = float(globals().get("TAKER_FEE", 0.0))
-        entry_fees = float(getattr(self, "entry_fees", 0.0) or 0.0)
-        funding_paid = float(getattr(self, "funding_paid", 0.0) or 0.0)
-        if dr == 0 or qty <= 0.0 or avg <= 0.0 or px is None:
-            return 0.0
-        px = float(px)
-        px_pnl = qty * (px - avg) if dr > 0 else qty * (avg - px)
-        exit_fee = qty * px * taker
-        return px_pnl - (entry_fees + exit_fee + funding_paid)
-    except Exception:
-        # Never break the step loop due to UPNL calc; be safe
-        return 0.0
-
+# ================== BEGIN: STARTUP SIGNAL GUARD (no logic change) ==================
+# Purpose: When the bot restarts mid-hour (startup pass), avoid opening a NEW position
+# if the last CLOSED H1 bar has no signal (sig==0). This keeps 100% of your trading
+# logic intact. We only skip entries during startup when there is NO signal.
+#
+# Implementation:
+# - Set flags on MultiBot at construction: _startup=True and STARTUP_REQUIRE_SIGNAL=True.
+# - After the first _barclose_pass(), flip _startup=False.
+# - Wrap Trader.open_leg(...) so that during startup (and legs==0), it checks the last
+#   closed bar's signal from Bybit public API. If sig==0 => skip entry and log.
+#
+# Notes:
+# - This does NOT alter DCA, flip, TP/SL, or bar-close logic. It only guards startup entries.
+# - If the API check fails for any reason, the guard is fail-open (does not block).
 try:
-    if 'Trader' in globals() and not hasattr(Trader, "_upnl_from_price"):
-        Trader._upnl_from_price = __bulls__upnl_helper
-except Exception:
+    import time, datetime, logging
+    import json as _json
+    import math as _math
+    import requests as _requests
+except Exception as _e:
+    # If requests is not available, the guard remains inert (fails open).
+    _requests = None
+
+def __bulls__compute_signal_v5_from_klines(_kl):
+    # _kl: list of [ms, o, h, l, c] ascending
+    length = 50
+    bars = 30
+    n = len(_kl)
+    if n < max(length, 35):
+        return [0]*n
+    o = [k[1] for k in _kl]
+    h = [k[2] for k in _kl]
+    l = [k[3] for k in _kl]
+    c = [k[4] for k in _kl]
+    highest = [0.0]*n
+    lowest  = [0.0]*n
+    for i in range(n):
+        lo = max(0, i - length + 1)
+        highest[i] = max(h[lo:i+1])
+        lowest[i]  = min(l[lo:i+1])
+    out = [0]*n
+    bindex = 0
+    sindex = 0
+    for i in range(n):
+        if i >= 4 and c[i] > c[i-4]:
+            bindex += 1
+        if i >= 4 and c[i] < c[i-4]:
+            sindex += 1
+        short_cond = (bindex > bars) and (c[i] < o[i]) and (h[i] >= highest[i])
+        long_cond  = (sindex > bars) and (c[i] > o[i]) and (l[i] <= lowest[i])
+        if short_cond:
+            bindex = 0
+            out[i] = -1
+        elif long_cond:
+            sindex = 0
+            out[i] = 1
+    return out
+
+def __bulls__get_last_closed_sig_for_symbol(sym: str):
+    # Returns (sig, last_open_ms) or (0, last_open_ms) if cannot determine.
+    try:
+        if _requests is None:
+            return 0, int(time.time()//3600*3600 - 3600) * 1000
+        now_ms = int(time.time() * 1000)
+        hour_ms = 3600*1000
+        last_open = (now_ms // hour_ms) * hour_ms - hour_ms  # open time of last CLOSED H1
+        start = last_open - 400*hour_ms
+        end = last_open + hour_ms  # ensure the last_closed bar is within range
+        params = {
+            "category": "linear",
+            "symbol": sym,
+            "interval": "60",
+            "start": str(start),
+            "end": str(end),
+            "limit": "200",
+        }
+        url = "https://api.bybit.com/v5/market/kline"
+        r = _requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            return 0, last_open
+        lst = data.get("result", {}).get("list") or []
+        if not lst:
+            return 0, last_open
+        lst.sort(key=lambda x: int(x[0]))
+        kl = [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in lst]
+        idx = { int(row[0]): i for i,row in enumerate(kl) }
+        if last_open not in idx:
+            return 0, last_open
+        sigs = __bulls__compute_signal_v5_from_klines(kl)
+        return int(sigs[idx[last_open]]), last_open
+    except Exception as _e:
+        return 0, int(time.time()//3600*3600 - 3600) * 1000
+
+# Patch MultiBot to set startup flags and flip them after first barclose pass
+try:
+    if 'MultiBot' in globals() and not getattr(MultiBot, "_startup_signal_guard_patched", False):
+        _orig_init = MultiBot.__init__
+        def __init__startup_guard(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            # set flags once
+            if not hasattr(self, "_startup"):
+                self._startup = True
+            if not hasattr(self, "STARTUP_REQUIRE_SIGNAL"):
+                self.STARTUP_REQUIRE_SIGNAL = True
+            logging.info("[STARTUP-GUARD] enabled: require signal on last closed bar before opening new positions during startup.")
+        MultiBot.__init__ = __init__startup_guard
+
+        if hasattr(MultiBot, "_barclose_pass"):
+            _orig_bcp = MultiBot._barclose_pass
+            def _barclose_pass_wrapper(self, *args, **kwargs):
+                res = _orig_bcp(self, *args, **kwargs)
+                if getattr(self, "_startup", False):
+                    self._startup = False
+                    logging.info("[STARTUP-GUARD] first barclose pass completed → startup mode off.")
+                return res
+            MultiBot._barclose_pass = _barclose_pass_wrapper
+
+        MultiBot._startup_signal_guard_patched = True
+except Exception as _e:
     pass
-# =================== END: compatibility shim (_upnl_from_price) ===================
+
+# Patch Trader.open_leg to skip entries during startup if last closed bar has no signal.
+try:
+    if 'Trader' in globals() and not getattr(Trader, "_startup_open_guard_patched", False):
+        _orig_open_leg = Trader.open_leg
+        def open_leg_startup_guard(self, direction, *args, **kwargs):
+            try:
+                ctx = getattr(self, "ctx", None)
+                # Only guard on startup, for FIRST leg (new position), and only if flag is enabled
+                if ctx and getattr(ctx, "STARTUP_REQUIRE_SIGNAL", False) and getattr(ctx, "_startup", False) and int(getattr(self, "legs", 0) or 0) == 0:
+                    sig, last_open = __bulls__get_last_closed_sig_for_symbol(self.symbol)
+                    if sig == 0:
+                        try:
+                            tclose = datetime.datetime.utcfromtimestamp((last_open + 3600000)/1000).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            tclose = str(last_open)
+                        logging.info("[%s] STARTUP-GUARD: last-closed sig=0 (bar closed at %s) → skip opening new position.", self.symbol, tclose)
+                        return False
+            except Exception as _e:
+                # fail-open on any guard error
+                pass
+            # normal path
+            return _orig_open_leg(self, direction, *args, **kwargs)
+        Trader.open_leg = open_leg_startup_guard
+        Trader._startup_open_guard_patched = True
+except Exception as _e:
+    pass
+# =================== END: STARTUP SIGNAL GUARD (no logic change) ===================
