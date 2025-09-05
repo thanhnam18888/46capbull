@@ -379,7 +379,7 @@ class Trader:
             self.funding_anchor = time.time()
 
         self.tp_pending = False
-               self.tp_px = None
+        self.tp_px = None
         self.tp_deadline = 0.0
 
         logging.info("[%s] OPEN leg #%d dir=%+d qty=%.6f @ %.6f (avg=%.6f)",
