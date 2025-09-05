@@ -781,12 +781,12 @@ class MultiBot:
                     now = time.time()
                     if now < target:
                         time.sleep(target - now)
-                # Startup-guard with fallback (process ALL symbols; avoid missing valid startup entries)
+                # Startup-guard with fallback (ALL symbols; avoid skip due to feed mismatch)
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
                     gsig, last_open = _bulls_get_last_closed_sig_for_symbol(s)
                     allow = True
                     if gsig == 0:
-                        # Fallback B: cross-check local vs remote-recomputed to avoid skipping true signals due to feed mismatch
+                        # Fallback B: tie-break using local vs remote-recalc (200 bars)
                         try:
                             kl_local = t.klines_tf(limit=KLINE_LIMIT)
                             if not kl_local or len(kl_local) < 61:
@@ -797,7 +797,10 @@ class MultiBot:
                                         kl_local = sorted(kl_local, key=lambda x: int(x[0]))
                                 except Exception:
                                     pass
-                                sigs_local = __bulls__compute_signal_v5_from_klines(kl_local)
+                                _compute = globals().get("__bulls__compute_signal_v5_from_klines")
+                                if _compute is None:
+                                    raise NameError("__bulls__compute_signal_v5_from_klines is missing")
+                                sigs_local = _compute(kl_local)
                                 idx_local = { int(row[0]): i for i,row in enumerate(kl_local) }
                                 lsig = int(sigs_local[idx_local.get(int(last_open), len(kl_local)-1)]) if int(last_open) in idx_local else 0
                                 if lsig != 0:
@@ -811,7 +814,10 @@ class MultiBot:
                                         lst = (data.get("result",{}) or {}).get("list") or []
                                         lst.sort(key=lambda x: int(x[0]))
                                         kl_remote = [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in lst]
-                                        sigs_remote = __bulls__compute_signal_v5_from_klines(kl_remote)
+                                        _compute = globals().get("__bulls__compute_signal_v5_from_klines")
+                                        if _compute is None:
+                                            raise NameError("__bulls__compute_signal_v5_from_klines is missing")
+                                        sigs_remote = _compute(kl_remote)
                                         idx_remote = { int(row[0]): i for i,row in enumerate(kl_remote) }
                                         rsig = int(sigs_remote[idx_remote.get(int(last_open), len(kl_remote)-1)]) if int(last_open) in idx_remote else 0
                                     except Exception:
@@ -820,12 +826,23 @@ class MultiBot:
                                 else:
                                     allow = False
                         except Exception as e:
-                            logging.warning("[%s] STARTUP-GUARD fallback failed: %s", s, e)
+                            # Rate-limited warnings to avoid spam
+                            try:
+                                self._startup_fallback_warns += 1
+                            except Exception:
+                                pass
+                            if getattr(self, "_startup_fallback_warns", 0) <= getattr(self, "_startup_fallback_warns_max", 5):
+                                logging.warning("[%s] STARTUP-GUARD fallback failed: %s", s, e)
+                                if self._startup_fallback_warns == self._startup_fallback_warns_max:
+                                    logging.warning("[STARTUP] further fallback warnings suppressed… (set MAX_STARTUP_WARN to increase)")
+                            else:
+                                logging.debug("[%s] STARTUP-GUARD fallback failed: %s", s, e)
                             allow = False
                         if not allow:
-                            logging.debug("[%s] STARTUP-GUARD(TF=%s): gsig=0 & fallback mismatch → skip opening new position.", s, TF_LABEL)
+                            logging.debug("[%s] STARTUP-GUARD: mismatch (gsig=0, local!=remote) → skip.", s)
                             self._startup_skipped_syms.append(s)
                             continue
+
                 prev_legs = t.legs
                 t.step()
                 if self._startup and prev_legs == 0 and t.legs > 0:
