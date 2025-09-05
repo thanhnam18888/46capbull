@@ -56,6 +56,9 @@ FLIP_ON_PROFIT        = True
 
 # Guards
 ENTRY_CONFIRM_BARS       = 1      # 1 = default; 2 = require last 2 H1 bars have same sig for entry
+
+ENTRY_REQUIRE_SIGNAL_GUARD = bool(int(os.getenv("ENTRY_REQUIRE_SIGNAL_GUARD", "1")))
+FLIP_REQUIRE_SIGNAL_GUARD  = bool(int(os.getenv("FLIP_REQUIRE_SIGNAL_GUARD", "1")))
 DCA_REQUIRE_SIGNAL_GUARD = True   # confirm the last CLOSED H1 bar (or seq) via public API
 DCA_CONFIRM_BARS         = 1      # 1 = last bar; 2 = last 2 bars same dir
 DCA_MIN_DRAWDOWN_PCT     = 0.0    # e.g. 0.015 = 1.5% drawdown required
@@ -210,6 +213,9 @@ class Trader:
         self.funding_anchor = None
         self.last_bar_ts = None
         self.last_close: Optional[float] = None  # cache close
+
+        # SAFEGUARDS state
+        self._last_action_bar_ts = None  # last closed bar ts we acted on (entry/flip)
 
         # TP maker-first state
         self.tp_pending = False
@@ -458,7 +464,23 @@ class Trader:
                          self.symbol, ts_str, TF_LABEL, sig, self.dir, self.legs, self._upnl_from_price(price_ref), self.last_close)
 
         # Flip immediately if single-leg and signal flipped
-        if self.dir != 0 and self.legs == 1 and sig == -self.dir:
+if self.dir != 0 and self.legs == 1 and sig == -self.dir:
+    # Debounce (C): avoid duplicate flip on the same closed bar
+    if self._last_action_bar_ts == last_ts:
+        logging.info("[%s] FLIP-SKIP(l1): already acted on bar %s", self.symbol, last_ts)
+    else:
+        # (B) FLIP remote guard (1 bar): confirm reverse signal from Bybit
+        ok_flip_remote = True
+        if FLIP_REQUIRE_SIGNAL_GUARD:
+            try:
+                gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                ok_flip_remote = (gsig == -self.dir)
+                if not ok_flip_remote:
+                    logging.info("[%s] FLIP-GUARD(l1): remote sig=%+d != need=%+d → skip flip", self.symbol, gsig, -self.dir)
+            except Exception as e:
+                logging.warning("[%s] FLIP-GUARD(l1): API err=%s → block flip", self.symbol, e)
+                ok_flip_remote = False
+        if ok_flip_remote:
             if getattr(self, "tp_pending", False):
                 try:
                     self.cancel_all_orders()
@@ -469,7 +491,9 @@ class Trader:
                 self.tp_deadline = 0.0
             self.close_all()
             self.open_leg(-self.dir)
-            return
+            self._last_action_bar_ts = last_ts
+    return
+
 
         self._funding_tick(price_ref)
 
