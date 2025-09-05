@@ -75,8 +75,8 @@ RL_KLINE_SEC             = 0.50   # slower for many symbols
 RL_MISC_SEC              = 0.12
 
 # Per-symbol scan spread (avoid burst at hh:00)
-SCAN_SPREAD_SEC          = 45.0   # spread first requests into this window
-START_JITTER_MAX_SEC     = 2.0    # one-time jitter at pass start
+SCAN_SPREAD_SEC          = 0.0   # spread first requests into this window
+START_JITTER_MAX_SEC     = 0.0    # one-time jitter at pass start
 
 # Kline payload
 KLINE_LIMIT              = 61     # enough lookback for the signal
@@ -548,12 +548,12 @@ class Trader:
                     if DCA_REQUIRE_SIGNAL_GUARD:
                         try:
                             if DCA_CONFIRM_BARS <= 1:
-                                gsig, _ = __bulls__get_last_closed_sig_for_symbol(self.symbol)
+                                gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
                                 ok_guard = (gsig == self.dir)
                                 if not ok_guard:
                                     logging.info("[%s] DCA-GUARD: confirm failed gsig=%+d need=%+d → skip DCA", self.symbol, gsig, self.dir)
                             else:
-                                seq = __bulls__get_sig_seq_for_last_n(self.symbol, DCA_CONFIRM_BARS)
+                                seq = _bulls_get_sig_seq_for_last_n(self.symbol, DCA_CONFIRM_BARS)
                                 ok_guard = (len(seq) == DCA_CONFIRM_BARS and all(s == self.dir for s in seq))
                                 if not ok_guard:
                                     logging.info("[%s] DCA-GUARD: confirm failed seq=%s need=%+d x%d → skip DCA",
@@ -770,7 +770,7 @@ class MultiBot:
                         time.sleep(target - now)
                 # Startup-guard: only for the first entry on startup
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
-                    gsig, _ = __bulls__get_last_closed_sig_for_symbol(s)
+                    gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
                     if gsig == 0:
                         logging.info("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
                         continue
@@ -860,7 +860,7 @@ def __bulls__last_open_ms(frame_sec: int) -> int:
     fm = int(frame_sec * 1000)
     return (now_ms // fm) * fm - fm  # open time of last CLOSED bar
 
-def __bulls__get_last_closed_sig_for_symbol(sym: str):
+def _bulls_get_last_closed_sig_for_symbol(sym: str):
     """Return (sig, last_open_ms) for the fixed H1 timeframe; (0, last_open_ms) on failure."""
     try:
         if _requests is None:
@@ -889,7 +889,7 @@ def __bulls__get_last_closed_sig_for_symbol(sym: str):
     except Exception:
         return 0, __bulls__last_open_ms(int(BARFRAME_SEC))
 
-def __bulls__get_sig_seq_for_last_n(sym: str, n: int):
+def _bulls_get_sig_seq_for_last_n(sym: str, n: int):
     """Return list of last n CLOSED H1 bar signals (ascending)."""
     try:
         if _requests is None or n <= 0:
