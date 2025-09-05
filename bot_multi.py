@@ -21,6 +21,9 @@ from typing import List, Dict, Optional
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 
+_last_closed_sig_cache = {}
+
+
 # =====================
 # ===== SETTINGS  =====
 # =====================
@@ -56,8 +59,6 @@ FLIP_ON_PROFIT        = True
 
 # Guards
 ENTRY_CONFIRM_BARS       = 1      # 1 = default; 2 = require last 2 H1 bars have same sig for entry
-ENTRY_REQUIRE_SIGNAL_GUARD = True   # confirm last CLOSED H1 bar via Bybit before entry
-FLIP_REQUIRE_SIGNAL_GUARD  = True   # confirm reverse signal 1-bar for legs==1 flip
 DCA_REQUIRE_SIGNAL_GUARD = True   # confirm the last CLOSED H1 bar (or seq) via public API
 DCA_CONFIRM_BARS         = 1      # 1 = last bar; 2 = last 2 bars same dir
 DCA_MIN_DRAWDOWN_PCT     = 0.0    # e.g. 0.015 = 1.5% drawdown required
@@ -432,7 +433,7 @@ class Trader:
         try:
             BARFRAME_MS = int(BARFRAME_SEC * 1000)
             _now_ms = int(time.time() * 1000)
-            while kl and int(kl[-1][0]) + BARFRAME_MS > _now_ms:
+            while kl and int(kl[-1][0]) + BARFRAME_MS + GUARD_BUFFER_MS > _now_ms:
                 kl = kl[:-1]
         except Exception:
             pass
@@ -461,28 +462,17 @@ class Trader:
 
         # Flip immediately if single-leg and signal flipped
         if self.dir != 0 and self.legs == 1 and sig == -self.dir:
-            ok_flip = True
-            if FLIP_REQUIRE_SIGNAL_GUARD:
+            if getattr(self, "tp_pending", False):
                 try:
-                    gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
-                    ok_flip = (gsig == -self.dir)
-                    if not ok_flip:
-                        logging.info("[%s] FLIP-GUARD(l1): confirm failed gsig=%+d need=%+d → skip flip", self.symbol, gsig, -self.dir)
-                except Exception as e:
-                    logging.warning("[%s] FLIP-GUARD(l1): API err=%s → block flip", self.symbol, e)
-                    ok_flip = False
-            if ok_flip:
-                if getattr(self, "tp_pending", False):
-                    try:
-                        self.cancel_all_orders()
-                    except Exception:
-                        pass
-                    self.tp_pending = False
-                    self.tp_px = None
-                    self.tp_deadline = 0.0
-                self.close_all()
-                self.open_leg(-self.dir)
-                return
+                    self.cancel_all_orders()
+                except Exception:
+                    pass
+                self.tp_pending = False
+                self.tp_px = None
+                self.tp_deadline = 0.0
+            self.close_all()
+            self.open_leg(-self.dir)
+            return
 
         self._funding_tick(price_ref)
 
@@ -537,18 +527,7 @@ class Trader:
                     else:
                         ok_entry = False
                 if ok_entry:
-                    # Remote confirm 1 bar via Bybit OHLC
-                    if ENTRY_REQUIRE_SIGNAL_GUARD:
-                        try:
-                            gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
-                            if gsig != sig:
-                                logging.info("[%s] ENTRY-GUARD: remote sig=%+d != local sig=%+d → skip entry", self.symbol, gsig, sig)
-                                ok_entry = False
-                        except Exception as e:
-                            logging.warning("[%s] ENTRY-GUARD: API err=%s → block entry", self.symbol, e)
-                            ok_entry = False
-                    if ok_entry:
-                        self.open_leg(sig)
+                    self.open_leg(sig)
                 else:
                     logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
                                  self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
@@ -805,68 +784,13 @@ class MultiBot:
                     now = time.time()
                     if now < target:
                         time.sleep(target - now)
-                # Startup-guard with fallback (ALL symbols; avoid skip due to feed mismatch)
+                # Startup-guard: only for the first entry on startup
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
-                    gsig, last_open = _bulls_get_last_closed_sig_for_symbol(s)
-                    allow = True
+                    gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
                     if gsig == 0:
-                        # Fallback B: tie-break using local vs remote-recalc (200 bars)
-                        try:
-                            kl_local = t.klines_tf(limit=KLINE_LIMIT)
-                            if not kl_local or len(kl_local) < 61:
-                                allow = False
-                            else:
-                                try:
-                                    if len(kl_local) >= 2 and int(kl_local[0][0]) > int(kl_local[-1][0]):
-                                        kl_local = sorted(kl_local, key=lambda x: int(x[0]))
-                                except Exception:
-                                    pass
-                                _compute = globals().get("__bulls__compute_signal_v5_from_klines")
-                                if _compute is None:
-                                    raise NameError("__bulls__compute_signal_v5_from_klines is missing")
-                                sigs_local = _compute(kl_local)
-                                idx_local = { int(row[0]): i for i,row in enumerate(kl_local) }
-                                lsig = int(sigs_local[idx_local.get(int(last_open), len(kl_local)-1)]) if int(last_open) in idx_local else 0
-                                if lsig != 0:
-                                    try:
-                                        url = "https://api.bybit.com/v5/market/kline"
-                                        start = int(last_open) - 400 * int(BARFRAME_SEC * 1000)
-                                        end   = int(last_open) + int(BARFRAME_SEC * 1000)
-                                        params = {"category":"linear","symbol":s,"interval":BYBIT_INTERVAL,"start":str(start),"end":str(end),"limit":"200"}
-                                        r = _requests.get(url, params=params, timeout=10); r.raise_for_status()
-                                        data = r.json()
-                                        lst = (data.get("result",{}) or {}).get("list") or []
-                                        lst.sort(key=lambda x: int(x[0]))
-                                        kl_remote = [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in lst]
-                                        _compute = globals().get("__bulls__compute_signal_v5_from_klines")
-                                        if _compute is None:
-                                            raise NameError("__bulls__compute_signal_v5_from_klines is missing")
-                                        sigs_remote = _compute(kl_remote)
-                                        idx_remote = { int(row[0]): i for i,row in enumerate(kl_remote) }
-                                        rsig = int(sigs_remote[idx_remote.get(int(last_open), len(kl_remote)-1)]) if int(last_open) in idx_remote else 0
-                                    except Exception:
-                                        rsig = 0
-                                    allow = (rsig == lsig)
-                                else:
-                                    allow = False
-                        except Exception as e:
-                            # Rate-limited warnings to avoid spam
-                            try:
-                                self._startup_fallback_warns += 1
-                            except Exception:
-                                pass
-                            if getattr(self, "_startup_fallback_warns", 0) <= getattr(self, "_startup_fallback_warns_max", 5):
-                                logging.warning("[%s] STARTUP-GUARD fallback failed: %s", s, e)
-                                if self._startup_fallback_warns == self._startup_fallback_warns_max:
-                                    logging.warning("[STARTUP] further fallback warnings suppressed… (set MAX_STARTUP_WARN to increase)")
-                            else:
-                                logging.debug("[%s] STARTUP-GUARD fallback failed: %s", s, e)
-                            allow = False
-                        if not allow:
-                            logging.debug("[%s] STARTUP-GUARD: mismatch (gsig=0, local!=remote) → skip.", s)
-                            self._startup_skipped_syms.append(s)
-                            continue
-
+                        logging.debug("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
+                        self._startup_skipped_syms.append(s)
+                        continue
                 prev_legs = t.legs
                 t.step()
                 if self._startup and prev_legs == 0 and t.legs > 0:
