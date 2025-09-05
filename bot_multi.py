@@ -1,109 +1,105 @@
-
-# bot_multi_combined.py — Multi-symbol DCA bot for Bybit linear perp (Render)
-# Combines:
-#   (A) Full rate-limit mitigations to avoid ErrCode: 10006 bursts
-#   (B) Per-leg notional target = (equity/120) * leverage (your 1/120 then x5)
+# bot_multi.py — Multi-symbol DCA bot for Bybit (H1-only)
+# ENV only: BYBIT_API_KEY, BYBIT_API_SECRET
+# Timeframe is fixed to 1 hour (H1). All other settings are constants below.
 #
-# Highlights:
-# - Bar-close logic (H1) same as before (18.py style).
-# - Lazy ticker: only fetch live price right before placing an actual order.
-# - Kline cadence slowed via RL_KLINE_SEC (default 0.35s) + exponential backoff on 10006.
-# - No automatic "close-pass" retries by default (CLOSE_PASS_RETRIES=0) to avoid bursts after close.
-# - Reduced kline payload (KLINE_LIMIT=120) – still >= 61 bars for signal.
-# - Hourly dynamic leg uses leverage: dynamic_leg_usdt = (equity / 120) * LEVERAGE_X
-# - Budget/exposure computed from last_close/avg when possible (avoid ticker-spam).
+# Features:
+#   - H1 bar-close trading (drop in-progress bar)
+#   - Startup-guard: no first entry if last CLOSED H1 bar has no signal
+#   - DCA-guard: confirm last CLOSED H1 bar (or last N bars) via Bybit public API before DCA
+#   - Entry-confirm: require last N CLOSED bars share the same signal before opening
+#   - Rate limiting + per-symbol scan spreading (avoid 10006)
+#   - Dynamic per-leg notional from equity (eq/120 * leverage), refreshed hourly
 #
-# Env knobs (set in Render → Environment):
-#   RL_KLINE_SEC=0.35 | RL_MISC_SEC=0.12 | RL_LEV_SEC=0.30 | RL_SWITCH_SEC=0.30
-#   CLOSE_PASS_RETRIES=0 | KLINE_LIMIT=120 | STARTUP_PASS=1
-#   LEVERAGE_X=5.0 | LEG_USDT=15.0 (legacy default; not used if dynamic_leg_usdt set)
-#   MIN_NOTIONAL_USDT=5.0 | TP/SL/others same as your prior bot
+# Dependencies: pybit==2.*, requests
 #
 import os
 import time
 import logging
-from typing import List, Dict, Optional, Tuple
+import zlib
+from typing import List, Dict, Optional
+
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 
-# ---------- ENV helpers ----------
-def env_str(name: str, default: str) -> str:
-    v = os.getenv(name, default)
-    return v if v is not None else default
+# =====================
+# ===== SETTINGS  =====
+# =====================
+BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
+# Fixed timeframe: H1 only
+BARFRAME_SEC     = 3600     # 1 hour
+BYBIT_INTERVAL   = "60"     # Bybit kline interval for H1
+TF_LABEL         = "1h"
 
-def env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
+# Symbols file
+PAIRS_FILE            = "46cap.txt"
 
-# ---------- Config ----------
-BYBIT_API_KEY    = env_str("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = env_str("BYBIT_API_SECRET", "")
-CATEGORY         = "linear"
-LEVERAGE_X       = env_float("LEVERAGE_X", 5.0)
-LEG_USDT         = env_float("LEG_USDT", 15.0)  # used as fallback if equity lookup fails
-PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
+# Sizing / leverage
+LEVERAGE_X            = 5.0
+LEG_USDT_FALLBACK     = 15.0      # used if equity lookup fails at startup
+MIN_NOTIONAL_USDT     = 5.0
+VOL_SCALE_LONG        = 1.0
+VOL_SCALE_SHORT       = 1.0
+MAX_DCA               = -1        # -1 = unlimited
 
-TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
-FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)    # 0 by default
+# Fees & funding
+TAKER_FEE             = 0.0
+FUNDING_RATE_8H       = 0.0
 
-MAX_DCA          = env_int("MAX_DCA", -1)               # -1 = unlimited
-TP_PCT           = env_float("TP_PCT", 0.0)             # 0 = disabled
-TP_TTL_SEC       = env_float("TP_TTL_SEC", 8.0)
-TP_POST_ONLY     = env_int("TP_POST_ONLY", 1) == 1
-EMERGENCY_SL_PCT = env_float("EMERGENCY_SL_PCT", 0.0)   # 0 = disabled
-FLIP_ON_PROFIT   = env_int("FLIP_ON_PROFIT", 1) == 1
+# TP/SL (disabled by default)
+TP_PCT                = 0.0
+TP_TTL_SEC            = 8.0
+TP_POST_ONLY          = True
+EMERGENCY_SL_PCT      = 0.0
+FLIP_ON_PROFIT        = True
 
-VOL_SCALE_LONG   = env_float("VOL_SCALE_LONG", 1.0)
-VOL_SCALE_SHORT  = env_float("VOL_SCALE_SHORT", 1.0)
+# Guards
+ENTRY_CONFIRM_BARS       = 1      # 1 = default; 2 = require last 2 H1 bars have same sig for entry
+DCA_REQUIRE_SIGNAL_GUARD = True   # confirm the last CLOSED H1 bar (or seq) via public API
+DCA_CONFIRM_BARS         = 1      # 1 = last bar; 2 = last 2 bars same dir
+DCA_MIN_DRAWDOWN_PCT     = 0.0    # e.g. 0.015 = 1.5% drawdown required
+DCA_GUARD_FAIL_OPEN      = False  # API error → block DCA
 
-CROSS_BUDGET_USDT= env_float("CROSS_BUDGET_USDT", 0.0)  # 0 = disabled
-RESERVE_PCT      = env_float("RESERVE_PCT", 0.10)
+# Scheduler / pacing
+CLOSE_GRACE_SEC          = 5.0
+CLOSE_PASS_RETRIES       = 0
+CLOSE_PASS_RETRY_GAP     = 1.5
+IDLE_POLL_SEC            = 10.0
+STARTUP_PASS             = 1
 
-MIN_NOTIONAL_USDT = env_float("MIN_NOTIONAL_USDT", 5.0)
-# Entry confirm (optional; default 1)
-ENTRY_CONFIRM_BARS = int(os.getenv("ENTRY_CONFIRM_BARS", "1"))
+# Rate limit pacing
+RL_SWITCH_SEC            = 0.30
+RL_LEV_SEC               = 0.30
+RL_KLINE_SEC             = 0.50   # slower for many symbols
+RL_MISC_SEC              = 0.12
 
-
-# Anti-spam logging controls
-LOG_LEVEL        = env_str("LOG_LEVEL", "INFO").upper()
-LOG_VERBOSE_INIT = env_int("LOG_VERBOSE_INIT", 0) == 1
-LOG_THROTTLE_SEC = env_float("LOG_THROTTLE_SEC", 30.0)
-
-# Bar-close scheduler
-BARFRAME_SEC              = env_float("BARFRAME_SEC", 3600.0)
-CLOSE_GRACE_SEC           = env_float("CLOSE_GRACE_SEC", 2.0)
-CLOSE_PASS_RETRIES        = env_int("CLOSE_PASS_RETRIES", 0)    # default 0 to avoid bursts
-CLOSE_PASS_RETRY_GAP      = env_float("CLOSE_PASS_RETRY_GAP", 1.5)
-IDLE_POLL_SEC             = env_float("IDLE_POLL_SEC", 10.0)
-STARTUP_PASS              = env_int("STARTUP_PASS", 1)
-
-# Request pacing (account-wide)
-RL_SWITCH_SEC = env_float("RL_SWITCH_SEC", 0.30)
-RL_LEV_SEC    = env_float("RL_LEV_SEC",    0.30)
-RL_KLINE_SEC  = env_float("RL_KLINE_SEC",  0.35)  # ~3 req/s (weight-aware)
-RL_MISC_SEC   = env_float("RL_MISC_SEC",   0.12)
+# Per-symbol scan spread (avoid burst at hh:00)
+SCAN_SPREAD_SEC          = 45.0   # spread first requests into this window
+START_JITTER_MAX_SEC     = 2.0    # one-time jitter at pass start
 
 # Kline payload
-KLINE_LIMIT   = max(61, env_int("KLINE_LIMIT", 70))  # 61+ required for signal
+KLINE_LIMIT              = 61     # enough lookback for the signal
+
+# Logging
+LOG_LEVEL                = "INFO" # DEBUG/INFO/WARNING/ERROR
+LOG_BAR_SIG              = False  # log signal on each closed bar
+
+# =====================
+# ====== RUNTIME  =====
+# =====================
+CATEGORY = "linear"
 
 _level_map = {
     "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
     "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL
 }
-logging.basicConfig(level=_level_map.get(LOG_LEVEL, logging.INFO),
+logging.basicConfig(level=_level_map.get(LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname)s: %(message)s")
-logging.getLogger().setLevel(_level_map.get(LOG_LEVEL, logging.INFO))
+logging.getLogger().setLevel(_level_map.get(LOG_LEVEL.upper(), logging.INFO))
 
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise SystemExit("BYBIT_API_KEY / BYBIT_API_SECRET are required but missing. Set them in Render → Environment.")
+    raise SystemExit("BYBIT_API_KEY / BYBIT_API_SECRET are required but missing.")
 
 # ---------- Utils ----------
 class RateLimiter:
@@ -143,7 +139,16 @@ def round_step_floor(x: float, step: float) -> float:
     v = k * step
     return v if v > 0 else step
 
-# --- Lelec signal like 18.py (bar close) ---
+# Spread helper: deterministic offset per symbol within [0, SCAN_SPREAD_SEC)
+def _spread_offset(symbol: str) -> float:
+    try:
+        h = zlib.adler32(symbol.encode('utf-8')) & 0xffffffff
+        frac = (h % 1000000) / 1000000.0
+        return frac * float(SCAN_SPREAD_SEC)
+    except Exception:
+        return 0.0
+
+# --- Lelec-like signal (from 18.py, bar-close) ---
 def bulls_signal_from_klines_barclose(klines: List[List[float]]) -> List[int]:
     length = 50
     bars = 30
@@ -204,7 +209,7 @@ class Trader:
         self.funding_paid = 0.0
         self.funding_anchor = None
         self.last_bar_ts = None
-        self.last_close: Optional[float] = None  # <-- cache
+        self.last_close: Optional[float] = None  # cache close
 
         # TP maker-first state
         self.tp_pending = False
@@ -216,13 +221,8 @@ class Trader:
         try:
             rl_switch.wait()
             self.client.switch_position_mode(category=CATEGORY, symbol=self.symbol, mode=0)
-            if LOG_VERBOSE_INIT:
-                logging.info("[%s] position mode set One-Way", self.symbol)
         except InvalidRequestError as e:
-            if "110025" in str(e):
-                if LOG_VERBOSE_INIT:
-                    logging.debug("[%s] already One-Way", self.symbol)
-            else:
+            if "110025" not in str(e):
                 logging.warning("[%s] switch mode failed: %s", self.symbol, e)
         except Exception as e:
             logging.warning("[%s] switch mode failed: %s", self.symbol, e)
@@ -232,28 +232,23 @@ class Trader:
             rl_lev.wait()
             self.client.set_leverage(category=CATEGORY, symbol=self.symbol,
                                      buyLeverage=str(LEVERAGE_X), sellLeverage=str(LEVERAGE_X))
-            if LOG_VERBOSE_INIT:
-                logging.info("[%s] leverage set to %.1fx", self.symbol, LEVERAGE_X)
         except InvalidRequestError as e:
             msg = str(e)
-            if "110043" in msg:       # leverage not modified
-                if LOG_VERBOSE_INIT:
-                    logging.debug("[%s] leverage already %.1fx", self.symbol, LEVERAGE_X)
-            elif "110074" in msg:     # closed contract
+            if "110074" in msg:     # closed contract
                 logging.error("[%s] closed contract; disabling", self.symbol)
                 setattr(self, "_disabled", True)
-            else:
+            elif "110043" not in msg:     # leverage not modified → ignore
                 logging.warning("[%s] set leverage failed: %s", self.symbol, e)
         except Exception as e:
             logging.warning("[%s] set leverage failed: %s", self.symbol, e)
 
     # ---- data fetch ----
-    def klines_1h(self, limit: int = KLINE_LIMIT) -> List[List[float]]:
-        backoff = 0.8  # start slower for safety
+    def klines_tf(self, limit: int = KLINE_LIMIT) -> List[List[float]]:
+        backoff = 0.8
         for attempt in range(6):
             try:
                 rl_kline.wait()
-                r = self.client.get_kline(category=CATEGORY, symbol=self.symbol, interval="60", limit=limit)
+                r = self.client.get_kline(category=CATEGORY, symbol=self.symbol, interval=BYBIT_INTERVAL, limit=limit)
                 out: List[List[float]] = []
                 for it in r["result"]["list"]:
                     ts = int(it[0]); o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
@@ -263,24 +258,18 @@ class Trader:
             except Exception as e:
                 msg = str(e).lower()
                 if "10006" in msg or "rate limit" in msg:
-                    # calm down globally if we hit the wall
-                    time.sleep(backoff)
-                    backoff = min(backoff * 1.6, 8.0)
-                    continue
+                    time.sleep(backoff); backoff = min(backoff * 1.6, 8.0); continue
                 if attempt < 2:
-                    time.sleep(backoff)
-                    backoff = min(backoff * 1.6, 8.0)
-                    continue
+                    time.sleep(backoff); backoff = min(backoff * 1.6, 8.0); continue
                 raise
-        raise RuntimeError(f"[{self.symbol}] get_kline failed after retries (rate limit or network)")
+        raise RuntimeError(f"[{self.symbol}] get_kline failed after retries")
 
     def _format_qty_for_exchange(self, qty: float) -> str:
-        from decimal import Decimal, ROUND_DOWN
+        from decimal import Decimal
         step = Decimal(str(self.qty_step))
         q = (Decimal(str(qty)) // step) * step  # floor to step
         if q <= 0:
             q = step
-        # Enforce minQty
         min_q = Decimal(str(self.min_qty))
         if q < min_q:
             q = min_q
@@ -339,9 +328,8 @@ class Trader:
             logging.warning("[%s] place_limit failed: %s", self.symbol, e)
             return None
 
-    # ---- position ops (use live price only when actually trading) ----
+    # ---- position ops ----
     def _fetch_live_price(self) -> float:
-        # lightweight ticker (no caching); called sparingly
         rl_misc.wait()
         r = self.client.get_tickers(category=CATEGORY, symbol=self.symbol)
         return float(r["result"]["list"][0]["lastPrice"])
@@ -350,33 +338,16 @@ class Trader:
         from math import ceil
         idx = self.legs
         scale = VOL_SCALE_LONG if dir_sign > 0 else VOL_SCALE_SHORT
-        base_usdt = getattr(self.ctx, 'dynamic_leg_usdt', float(LEG_USDT)) or float(LEG_USDT)
+        base_usdt = getattr(self.ctx, 'dynamic_leg_usdt', float(LEG_USDT_FALLBACK)) or float(LEG_USDT_FALLBACK)
         leg_usdt = base_usdt * (scale ** idx)
 
-        left = None
-        if CROSS_BUDGET_USDT > 0.0:
-            used = self.ctx.total_exposure_usdt(self.symbol, price_hint=price)
-            left = CROSS_BUDGET_USDT * (1.0 - RESERVE_PCT) - used
-            if left <= 0:
-                return 0.0
-            leg_usdt = min(leg_usdt, left)
-
-        if leg_usdt < MIN_NOTIONAL_USDT:
-            if CROSS_BUDGET_USDT > 0.0:
-                if left is not None and left < MIN_NOTIONAL_USDT:
-                    return 0.0
-                leg_usdt = min(max(MIN_NOTIONAL_USDT, leg_usdt), left if left is not None else MIN_NOTIONAL_USDT)
-            else:
-                leg_usdt = MIN_NOTIONAL_USDT
-
         qty = leg_usdt / price
-        qty = round_step_floor(qty, self.qty_step)
+        step = self.qty_step
+        qty = int(qty / step + 1e-12) * step  # floor to step
         if qty < self.min_qty:
             qty = self.min_qty
         if qty * price < MIN_NOTIONAL_USDT:
-            target_qty = ceil(MIN_NOTIONAL_USDT / price / self.qty_step) * self.qty_step
-            if CROSS_BUDGET_USDT > 0.0 and left is not None and target_qty * price > left:
-                return 0.0
+            target_qty = ceil(MIN_NOTIONAL_USDT / price / step) * step
             qty = max(qty, target_qty)
         return max(qty, self.min_qty)
 
@@ -408,7 +379,7 @@ class Trader:
             self.funding_anchor = time.time()
 
         self.tp_pending = False
-        self.tp_px = None
+               self.tp_px = None
         self.tp_deadline = 0.0
 
         logging.info("[%s] OPEN leg #%d dir=%+d qty=%.6f @ %.6f (avg=%.6f)",
@@ -434,19 +405,19 @@ class Trader:
 
     # ---- periodic logic ----
     def _funding_tick(self, price: float):
-        if FUNDING_8H <= 0.0 or self.dir == 0 or self.qty <= 0 or self.funding_anchor is None:
+        if FUNDING_RATE_8H <= 0.0 or self.dir == 0 or self.qty <= 0 or self.funding_anchor is None:
             return
         period = 8.0 * 3600.0
         now = time.time()
         while self.funding_anchor + period <= now:
             notional = self.qty * price
-            self.funding_paid += notional * FUNDING_8H
+            self.funding_paid += notional * FUNDING_RATE_8H
             self.funding_anchor += period
 
     def step(self):
         if getattr(self, 'disabled', False):
             return
-        kl = self.klines_1h(limit=KLINE_LIMIT)
+        kl = self.klines_tf(limit=KLINE_LIMIT)
         if not kl or len(kl) < 61:
             logging.debug("[%s] insufficient klines; skip", self.symbol)
             return
@@ -457,8 +428,7 @@ class Trader:
         except Exception:
             pass
         try:
-            import time
-            BARFRAME_MS = 60 * 60 * 1000
+            BARFRAME_MS = int(BARFRAME_SEC * 1000)
             _now_ms = int(time.time() * 1000)
             while kl and int(kl[-1][0]) + BARFRAME_MS > _now_ms:
                 kl = kl[:-1]
@@ -466,20 +436,28 @@ class Trader:
             pass
         # === END: closed-bar & ordering guard ===
 
-        kl_closed = kl  # drop potentially in-progress
+        kl_closed = kl
         last_ts = int(kl_closed[-1][0])
         if self.last_bar_ts == last_ts:
             return
         self.last_bar_ts = last_ts
         self.last_close = float(kl_closed[-1][4])
 
-        # 18.py signal
-        sig = bulls_signal_from_klines_barclose(kl_closed)[-1]
+        sig_arr = bulls_signal_from_klines_barclose(kl_closed)
+        sig = sig_arr[-1]
 
-        # Use bar-close price for decision; fetch live only when we actually trade
         price_ref = self.last_close
 
-        # FAST PATH: flip immediately if single-leg and signal flipped
+        if LOG_BAR_SIG:
+            try:
+                ts_sec = last_ts // 1000 if last_ts > 10**12 else last_ts
+                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts_sec))
+            except Exception:
+                ts_str = str(last_ts)
+            logging.info("[%s] BAR %s | tf=%s | sig=%+d dir=%+d legs=%d upnl=%.4f close=%.6f",
+                         self.symbol, ts_str, TF_LABEL, sig, self.dir, self.legs, self._upnl_from_price(price_ref), self.last_close)
+
+        # Flip immediately if single-leg and signal flipped
         if self.dir != 0 and self.legs == 1 and sig == -self.dir:
             if getattr(self, "tp_pending", False):
                 try:
@@ -495,7 +473,7 @@ class Trader:
 
         self._funding_tick(price_ref)
 
-        # TP maker-first with TTL; SL market — decisions at bar close using price_ref
+        # TP / SL
         if self.dir != 0 and self.qty > 0 and self.avg is not None:
             if TP_PCT > 0.0:
                 want_tp = self.avg * (1.0 + self.dir * TP_PCT)
@@ -535,19 +513,60 @@ class Trader:
                     self.close_all()
                     return
 
+        # ---- ENTRY when flat ----
         if self.dir == 0:
             if sig != 0:
-                self.open_leg(sig)
+                ok_entry = True
+                if ENTRY_CONFIRM_BARS > 1:
+                    if len(sig_arr) >= ENTRY_CONFIRM_BARS:
+                        tail = sig_arr[-ENTRY_CONFIRM_BARS:]
+                        ok_entry = all(s == sig for s in tail)
+                    else:
+                        ok_entry = False
+                if ok_entry:
+                    self.open_leg(sig)
+                else:
+                    logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
+                                 self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
             return
 
+        # ---- POSITION MANAGEMENT ----
         upnl = self._upnl_from_price(price_ref)
 
+        # DCA / Flip logic
         if sig == self.dir:
             if upnl < 0.0:
-                if MAX_DCA < 0 or self.legs < 1 + MAX_DCA:
-                    self.open_leg(self.dir)
+                # min drawdown
+                dd_pct = 0.0
+                if self.avg is not None and self.avg > 0:
+                    dd_pct = (price_ref / self.avg - 1.0) if self.dir > 0 else (1.0 - price_ref / self.avg)
+                if DCA_MIN_DRAWDOWN_PCT > 0.0 and dd_pct > -DCA_MIN_DRAWDOWN_PCT:
+                    logging.info("[%s] DCA-GUARD: skip (drawdown %.3f%% > -%.3f%% req)",
+                                 self.symbol, dd_pct*100.0, DCA_MIN_DRAWDOWN_PCT*100.0)
                 else:
-                    logging.info("[%s] MAX_DCA reached; skip DCA", self.symbol)
+                    ok_guard = True
+                    if DCA_REQUIRE_SIGNAL_GUARD:
+                        try:
+                            if DCA_CONFIRM_BARS <= 1:
+                                gsig, _ = __bulls__get_last_closed_sig_for_symbol(self.symbol)
+                                ok_guard = (gsig == self.dir)
+                                if not ok_guard:
+                                    logging.info("[%s] DCA-GUARD: confirm failed gsig=%+d need=%+d → skip DCA", self.symbol, gsig, self.dir)
+                            else:
+                                seq = __bulls__get_sig_seq_for_last_n(self.symbol, DCA_CONFIRM_BARS)
+                                ok_guard = (len(seq) == DCA_CONFIRM_BARS and all(s == self.dir for s in seq))
+                                if not ok_guard:
+                                    logging.info("[%s] DCA-GUARD: confirm failed seq=%s need=%+d x%d → skip DCA",
+                                                 self.symbol, seq, self.dir, DCA_CONFIRM_BARS)
+                        except Exception as e:
+                            ok_guard = DCA_GUARD_FAIL_OPEN
+                            logging.warning("[%s] DCA-GUARD: API err=%s → %s", self.symbol, e,
+                                            "fail-open (allow DCA)" if ok_guard else "block DCA")
+                    if ok_guard:
+                        if MAX_DCA < 0 or self.legs < 1 + MAX_DCA:
+                            self.open_leg(self.dir)
+                        else:
+                            logging.info("[%s] MAX_DCA reached; skip DCA", self.symbol)
         elif sig == -self.dir:
             if self.legs == 1:
                 self.close_all()
@@ -559,6 +578,7 @@ class Trader:
                     self.open_leg(-self.dir)
                     return
 
+        # Breakeven exit after multiple legs
         if self.legs > 1 and upnl >= 0.0 and sig == 0:
             self.close_all()
 
@@ -579,7 +599,6 @@ def _next_bar_close(now: Optional[float] = None) -> int:
 class MultiBot:
     def __init__(self, symbols: List[str]):
         self.client = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=5000)
-        self._skipped: List[str] = []
         self._err_gate: Dict[str, float] = {}
         self.symbols = self._filter_live(symbols)
         self.traders: Dict[str, Trader] = {}
@@ -589,16 +608,13 @@ class MultiBot:
             t = Trader(self.client, s, cfg, ctx=self)
             t.init_on_exchange()
             self.traders[s] = t
-        self.dynamic_leg_usdt = float(LEG_USDT)
+        self.dynamic_leg_usdt = float(LEG_USDT_FALLBACK)
         self._last_budget_hour = -1  # hour marker
+        self._startup = True
+        self.STARTUP_REQUIRE_SIGNAL = True
 
-        if self._skipped:
-            preview = ", ".join(self._skipped[:20])
-            more = "" if len(self._skipped) <= 20 else f" (+{len(self._skipped)-20} more)"
-            logging.info("Skipped %d non-live symbols: %s%s", len(self._skipped), preview, more)
-
-        logging.info("MultiBot started for %d symbols; LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f",
-                     len(self.traders), LEG_USDT, LEVERAGE_X, TAKER_FEE, FUNDING_8H)
+        logging.info("MultiBot started for %d symbols; TF=%s (%ds) | LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f | ENTRY_CONFIRM_BARS=%d | DCA_CONFIRM_BARS=%d",
+                     len(self.traders), TF_LABEL, int(BARFRAME_SEC), LEG_USDT_FALLBACK, LEVERAGE_X, TAKER_FEE, FUNDING_RATE_8H, ENTRY_CONFIRM_BARS, DCA_CONFIRM_BARS)
 
         # Startup: compute hourly base leg now (with leverage)
         try:
@@ -617,8 +633,6 @@ class MultiBot:
                 r = self.client.get_instruments_info(category=CATEGORY, symbol=s)
                 lst = r.get("result", {}).get("list", [])
                 if not lst:
-                    if LOG_VERBOSE_INIT:
-                        logging.debug("[%s] instruments info empty; using defaults", s)
                     m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
                     continue
                 it = lst[0]
@@ -638,8 +652,6 @@ class MultiBot:
                     tick = 0.001
                 m[s] = {"qty_step": qty_step, "min_qty": min_qty, "tick": tick, "status": it.get("status", "")}
             except Exception as e:
-                if LOG_VERBOSE_INIT:
-                    logging.debug("[%s] instruments info error: %s; using defaults", s, e)
                 m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
         return m
 
@@ -659,14 +671,15 @@ class MultiBot:
                 # Fallback to klines presence
                 try:
                     rl_kline.wait()
-                    kr = self.client.get_kline(category=CATEGORY, symbol=s, interval="60", limit=2)
+                    kr = self.client.get_kline(category=CATEGORY, symbol=s, interval=BYBIT_INTERVAL, limit=2)
                     if kr.get("result", {}).get("list"):
                         live.append(s)
                         continue
                 except Exception:
                     pass
 
-                self._skipped.append(s)
+                # If instrument lookup fails, still keep the symbol; we will discover at order time.
+                live.append(s)
             except Exception:
                 live.append(s)
         return live
@@ -679,7 +692,6 @@ class MultiBot:
             if s == sym_hint and price_hint is not None:
                 price = price_hint
             else:
-                # avoid ticker; use cached last_close or avg
                 price = t.last_close if t.last_close is not None else (t.avg or 0.0)
             total += abs(t.qty * price)
         return total
@@ -723,9 +735,10 @@ class MultiBot:
         return 0.0
 
     def _update_hourly_budget_if_due(self, next_close_ts: int):
+        # Keep budget refresh hourly
         try:
             now = int(time.time())
-            trigger_ts = int(next_close_ts) - 1800  # H:30:00
+            trigger_ts = int(next_close_ts) - 1800  # H:30 relative to the coming bar's close
             hour_marker = int(next_close_ts // 3600)
             if now >= trigger_ts and self._last_budget_hour != hour_marker:
                 eq = self._safe_get_equity_usdt()
@@ -740,20 +753,40 @@ class MultiBot:
             logging.warning("[BUDGET] update failed: %s", e)
 
     def _barclose_pass(self):
+        bar_pass_start = time.time()
+        # Optional jitter at start
+        if START_JITTER_MAX_SEC > 0:
+            time.sleep(START_JITTER_MAX_SEC)
+
         for s, t in list(self.traders.items()):
             if getattr(t, "_disabled", False):
                 continue
             try:
+                # spread calls across SCAN_SPREAD_SEC after bar close
+                if SCAN_SPREAD_SEC > 0:
+                    target = bar_pass_start + _spread_offset(s)
+                    now = time.time()
+                    if now < target:
+                        time.sleep(target - now)
+                # Startup-guard: only for the first entry on startup
+                if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
+                    gsig, _ = __bulls__get_last_closed_sig_for_symbol(s)
+                    if gsig == 0:
+                        logging.info("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
+                        continue
                 t.step()
             except Exception as e:
                 now = time.time()
                 last = self._err_gate.get(s, 0.0)
-                if now - last >= LOG_THROTTLE_SEC:
+                if now - last >= 30.0:
                     self._err_gate[s] = now
                     logging.exception("[%s] step error: %s", s, e)
                 else:
                     msg = str(e).splitlines()[0]
                     logging.warning("[%s] step error (muted): %s", s, msg)
+        if self._startup:
+            self._startup = False
+            logging.info("[STARTUP-GUARD] first barclose pass completed → startup mode off.")
 
     def loop(self):
         next_close = _next_bar_close()
@@ -775,7 +808,6 @@ class MultiBot:
             if now < next_close + CLOSE_GRACE_SEC:
                 time.sleep(next_close + CLOSE_GRACE_SEC - now)
 
-            # one pass (sequential; rate-limited internally)
             self._barclose_pass()
             for _ in range(int(CLOSE_PASS_RETRIES)):
                 time.sleep(CLOSE_PASS_RETRY_GAP)
@@ -783,38 +815,13 @@ class MultiBot:
 
             next_close += int(BARFRAME_SEC)
 
-# ---------- Main ----------
-if __name__ == "__main__":
-    syms = read_pairs(PAIRS_FILE)
-    if not syms:
-        raise SystemExit(f"No symbols loaded from {PAIRS_FILE}")
-    MultiBot(syms).loop()
-
-# ================== BEGIN: STARTUP SIGNAL GUARD (no logic change) ==================
-# Purpose: When the bot restarts mid-hour (startup pass), avoid opening a NEW position
-# if the last CLOSED H1 bar has no signal (sig==0). This keeps 100% of your trading
-# logic intact. We only skip entries during startup when there is NO signal.
-#
-# Implementation:
-# - Set flags on MultiBot at construction: _startup=True and STARTUP_REQUIRE_SIGNAL=True.
-# - After the first _barclose_pass(), flip _startup=False.
-# - Wrap Trader.open_leg(...) so that during startup (and legs==0), it checks the last
-#   closed bar's signal from Bybit public API. If sig==0 => skip entry and log.
-#
-# Notes:
-# - This does NOT alter DCA, flip, TP/SL, or bar-close logic. It only guards startup entries.
-# - If the API check fails for any reason, the guard is fail-open (does not block).
+# ---------- Public API guards (Bybit) ----------
 try:
-    import time, datetime, logging
-    import json as _json
-    import math as _math
     import requests as _requests
-except Exception as _e:
-    # If requests is not available, the guard remains inert (fails open).
+except Exception:
     _requests = None
 
 def __bulls__compute_signal_v5_from_klines(_kl):
-    # _kl: list of [ms, o, h, l, c] ascending
     length = 50
     bars = 30
     n = len(_kl)
@@ -848,24 +855,21 @@ def __bulls__compute_signal_v5_from_klines(_kl):
             out[i] = 1
     return out
 
+def __bulls__last_open_ms(frame_sec: int) -> int:
+    now_ms = int(time.time() * 1000)
+    fm = int(frame_sec * 1000)
+    return (now_ms // fm) * fm - fm  # open time of last CLOSED bar
+
 def __bulls__get_last_closed_sig_for_symbol(sym: str):
-    # Returns (sig, last_open_ms) or (0, last_open_ms) if cannot determine.
+    """Return (sig, last_open_ms) for the fixed H1 timeframe; (0, last_open_ms) on failure."""
     try:
         if _requests is None:
-            return 0, int(time.time()//3600*3600 - 3600) * 1000
-        now_ms = int(time.time() * 1000)
-        hour_ms = 3600*1000
-        last_open = (now_ms // hour_ms) * hour_ms - hour_ms  # open time of last CLOSED H1
-        start = last_open - 400*hour_ms
-        end = last_open + hour_ms  # ensure the last_closed bar is within range
-        params = {
-            "category": "linear",
-            "symbol": sym,
-            "interval": "60",
-            "start": str(start),
-            "end": str(end),
-            "limit": "200",
-        }
+            return 0, __bulls__last_open_ms(int(BARFRAME_SEC))
+        last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+        start = last_open - 400 * int(BARFRAME_SEC * 1000)
+        end   = last_open + int(BARFRAME_SEC * 1000)
+        params = {"category": "linear", "symbol": sym, "interval": BYBIT_INTERVAL,
+                  "start": str(start), "end": str(end), "limit": "200"}
         url = "https://api.bybit.com/v5/market/kline"
         r = _requests.get(url, params=params, timeout=10)
         r.raise_for_status()
@@ -882,61 +886,38 @@ def __bulls__get_last_closed_sig_for_symbol(sym: str):
             return 0, last_open
         sigs = __bulls__compute_signal_v5_from_klines(kl)
         return int(sigs[idx[last_open]]), last_open
-    except Exception as _e:
-        return 0, int(time.time()//3600*3600 - 3600) * 1000
+    except Exception:
+        return 0, __bulls__last_open_ms(int(BARFRAME_SEC))
 
-# Patch MultiBot to set startup flags and flip them after first barclose pass
-try:
-    if 'MultiBot' in globals() and not getattr(MultiBot, "_startup_signal_guard_patched", False):
-        _orig_init = MultiBot.__init__
-        def __init__startup_guard(self, *args, **kwargs):
-            _orig_init(self, *args, **kwargs)
-            # set flags once
-            if not hasattr(self, "_startup"):
-                self._startup = True
-            if not hasattr(self, "STARTUP_REQUIRE_SIGNAL"):
-                self.STARTUP_REQUIRE_SIGNAL = True
-            logging.info("[STARTUP-GUARD] enabled: require signal on last closed bar before opening new positions during startup.")
-        MultiBot.__init__ = __init__startup_guard
+def __bulls__get_sig_seq_for_last_n(sym: str, n: int):
+    """Return list of last n CLOSED H1 bar signals (ascending)."""
+    try:
+        if _requests is None or n <= 0:
+            return []
+        last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+        start   = last_open - max(400, n+5) * int(BARFRAME_SEC * 1000)
+        end     = last_open + int(BARFRAME_SEC * 1000)
+        url     = "https://api.bybit.com/v5/market/kline"
+        params  = {"category":"linear","symbol":sym,"interval":BYBIT_INTERVAL,
+                   "start":str(start),"end":str(end),"limit":"200"}
+        r = _requests.get(url, params=params, timeout=10); r.raise_for_status()
+        data = r.json()
+        lst  = (data.get("result",{}) or {}).get("list") or []
+        if not lst: return []
+        lst.sort(key=lambda x: int(x[0]))
+        kl = [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in lst]
+        sigs = __bulls__compute_signal_v5_from_klines(kl)
+        idx = { int(row[0]): i for i,row in enumerate(kl) }
+        if int(last_open) not in idx: return []
+        i_last = idx[int(last_open)]
+        i_from = max(0, i_last - (n - 1))
+        return [int(sigs[i]) for i in range(i_from, i_last + 1)]
+    except Exception:
+        return []
 
-        if hasattr(MultiBot, "_barclose_pass"):
-            _orig_bcp = MultiBot._barclose_pass
-            def _barclose_pass_wrapper(self, *args, **kwargs):
-                res = _orig_bcp(self, *args, **kwargs)
-                if getattr(self, "_startup", False):
-                    self._startup = False
-                    logging.info("[STARTUP-GUARD] first barclose pass completed → startup mode off.")
-                return res
-            MultiBot._barclose_pass = _barclose_pass_wrapper
-
-        MultiBot._startup_signal_guard_patched = True
-except Exception as _e:
-    pass
-
-# Patch Trader.open_leg to skip entries during startup if last closed bar has no signal.
-try:
-    if 'Trader' in globals() and not getattr(Trader, "_startup_open_guard_patched", False):
-        _orig_open_leg = Trader.open_leg
-        def open_leg_startup_guard(self, direction, *args, **kwargs):
-            try:
-                ctx = getattr(self, "ctx", None)
-                # Only guard on startup, for FIRST leg (new position), and only if flag is enabled
-                if ctx and getattr(ctx, "STARTUP_REQUIRE_SIGNAL", False) and getattr(ctx, "_startup", False) and int(getattr(self, "legs", 0) or 0) == 0:
-                    sig, last_open = __bulls__get_last_closed_sig_for_symbol(self.symbol)
-                    if sig == 0:
-                        try:
-                            tclose = datetime.datetime.utcfromtimestamp((last_open + 3600000)/1000).strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            tclose = str(last_open)
-                        logging.info("[%s] STARTUP-GUARD: last-closed sig=0 (bar closed at %s) → skip opening new position.", self.symbol, tclose)
-                        return False
-            except Exception as _e:
-                # fail-open on any guard error
-                pass
-            # normal path
-            return _orig_open_leg(self, direction, *args, **kwargs)
-        Trader.open_leg = open_leg_startup_guard
-        Trader._startup_open_guard_patched = True
-except Exception as _e:
-    pass
-# =================== END: STARTUP SIGNAL GUARD (no logic change) ===================
+# ---------- Main ----------
+if __name__ == "__main__":
+    syms = read_pairs(PAIRS_FILE)
+    if not syms:
+        raise SystemExit(f"No symbols loaded from {PAIRS_FILE}")
+    MultiBot(syms).loop()
