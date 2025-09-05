@@ -235,7 +235,7 @@ class Trader:
         except InvalidRequestError as e:
             msg = str(e)
             if "110074" in msg:     # closed contract
-                logging.error("[%s] closed contract; disabling", self.symbol)
+                logging.debug("[%s] closed contract; disabling", self.symbol)
                 setattr(self, "_disabled", True)
             elif "110043" not in msg:     # leverage not modified → ignore
                 logging.warning("[%s] set leverage failed: %s", self.symbol, e)
@@ -598,6 +598,7 @@ def _next_bar_close(now: Optional[float] = None) -> int:
 # ---------- MultiBot ----------
 class MultiBot:
     def __init__(self, symbols: List[str]):
+        self._skipped = []
         self.client = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=5000)
         self._err_gate: Dict[str, float] = {}
         self.symbols = self._filter_live(symbols)
@@ -609,9 +610,16 @@ class MultiBot:
             t.init_on_exchange()
             self.traders[s] = t
         self.dynamic_leg_usdt = float(LEG_USDT_FALLBACK)
+
+        if self._skipped:
+            preview = ", ".join(self._skipped[:20])
+            more = "" if len(self._skipped) <= 20 else f" (+{len(self._skipped)-20} more)"
+            logging.info("Skipped %d non-live symbols: %s%s", len(self._skipped), preview, more)
         self._last_budget_hour = -1  # hour marker
         self._startup = True
         self.STARTUP_REQUIRE_SIGNAL = True
+        self._startup_skipped_syms = []
+        self._startup_opened_syms = []
 
         logging.info("MultiBot started for %d symbols; TF=%s (%ds) | LEG_USDT=%.4f, lev=%.1fx, fee=%.4f, funding_8h=%.6f | ENTRY_CONFIRM_BARS=%d | DCA_CONFIRM_BARS=%d",
                      len(self.traders), TF_LABEL, int(BARFRAME_SEC), LEG_USDT_FALLBACK, LEVERAGE_X, TAKER_FEE, FUNDING_RATE_8H, ENTRY_CONFIRM_BARS, DCA_CONFIRM_BARS)
@@ -655,6 +663,8 @@ class MultiBot:
                 m[s] = {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.001, "status": ""}
         return m
 
+    
+
     def _filter_live(self, symbols: List[str]) -> List[str]:
         live: List[str] = []
         for s in symbols:
@@ -662,27 +672,30 @@ class MultiBot:
                 rl_misc.wait()
                 r = self.client.get_instruments_info(category=CATEGORY, symbol=s)
                 lst = r.get("result", {}).get("list", [])
-                st  = str(lst[0].get("status", "")).lower() if lst else ""
-
-                if st in ("trading", "1", "live"):
-                    live.append(s)
+                if lst:
+                    st = str(lst[0].get("status", "")).lower()
+                    # Only keep symbols explicitly marked trading/live
+                    if st in ("trading", "1", "live"):
+                        live.append(s)
+                    else:
+                        self._skipped.append(s)
                     continue
-
-                # Fallback to klines presence
+                # Fallback: if instrument API didn't return info, try kline presence
                 try:
                     rl_kline.wait()
                     kr = self.client.get_kline(category=CATEGORY, symbol=s, interval=BYBIT_INTERVAL, limit=2)
                     if kr.get("result", {}).get("list"):
                         live.append(s)
-                        continue
+                    else:
+                        self._skipped.append(s)
                 except Exception:
-                    pass
-
-                # If instrument lookup fails, still keep the symbol; we will discover at order time.
-                live.append(s)
+                    self._skipped.append(s)
             except Exception:
-                live.append(s)
+                # If even instruments API errors, treat as skipped to avoid runtime warnings
+                self._skipped.append(s)
         return live
+
+
 
     def total_exposure_usdt(self, sym_hint: Optional[str] = None, price_hint: Optional[float] = None) -> float:
         total = 0.0
@@ -772,9 +785,13 @@ class MultiBot:
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
                     gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
                     if gsig == 0:
-                        logging.info("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
+                        logging.debug("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
+                        self._startup_skipped_syms.append(s)
                         continue
+                prev_legs = t.legs
                 t.step()
+                if self._startup and prev_legs == 0 and t.legs > 0:
+                    self._startup_opened_syms.append(s)
             except Exception as e:
                 now = time.time()
                 last = self._err_gate.get(s, 0.0)
@@ -785,8 +802,11 @@ class MultiBot:
                     msg = str(e).splitlines()[0]
                     logging.warning("[%s] step error (muted): %s", s, msg)
         if self._startup:
+            skipped = len(self._startup_skipped_syms)
+            opened  = len(self._startup_opened_syms)
+            total   = len(self.traders)
             self._startup = False
-            logging.info("[STARTUP-GUARD] first barclose pass completed → startup mode off.")
+            logging.info("[STARTUP-GUARD] pass summary: skipped=%d (sig=0), opened=%d, total=%d → startup mode off.", skipped, opened, total)
 
     def loop(self):
         next_close = _next_bar_close()
