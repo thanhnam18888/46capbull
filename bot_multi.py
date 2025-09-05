@@ -56,6 +56,8 @@ FLIP_ON_PROFIT        = True
 
 # Guards
 ENTRY_CONFIRM_BARS       = 1      # 1 = default; 2 = require last 2 H1 bars have same sig for entry
+ENTRY_REQUIRE_SIGNAL_GUARD = True   # confirm last CLOSED H1 bar via Bybit before entry
+FLIP_REQUIRE_SIGNAL_GUARD  = True   # confirm reverse signal 1-bar for legs==1 flip
 DCA_REQUIRE_SIGNAL_GUARD = True   # confirm the last CLOSED H1 bar (or seq) via public API
 DCA_CONFIRM_BARS         = 1      # 1 = last bar; 2 = last 2 bars same dir
 DCA_MIN_DRAWDOWN_PCT     = 0.0    # e.g. 0.015 = 1.5% drawdown required
@@ -459,17 +461,28 @@ class Trader:
 
         # Flip immediately if single-leg and signal flipped
         if self.dir != 0 and self.legs == 1 and sig == -self.dir:
-            if getattr(self, "tp_pending", False):
+            ok_flip = True
+            if FLIP_REQUIRE_SIGNAL_GUARD:
                 try:
-                    self.cancel_all_orders()
-                except Exception:
-                    pass
-                self.tp_pending = False
-                self.tp_px = None
-                self.tp_deadline = 0.0
-            self.close_all()
-            self.open_leg(-self.dir)
-            return
+                    gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                    ok_flip = (gsig == -self.dir)
+                    if not ok_flip:
+                        logging.info("[%s] FLIP-GUARD(l1): confirm failed gsig=%+d need=%+d → skip flip", self.symbol, gsig, -self.dir)
+                except Exception as e:
+                    logging.warning("[%s] FLIP-GUARD(l1): API err=%s → block flip", self.symbol, e)
+                    ok_flip = False
+            if ok_flip:
+                if getattr(self, "tp_pending", False):
+                    try:
+                        self.cancel_all_orders()
+                    except Exception:
+                        pass
+                    self.tp_pending = False
+                    self.tp_px = None
+                    self.tp_deadline = 0.0
+                self.close_all()
+                self.open_leg(-self.dir)
+                return
 
         self._funding_tick(price_ref)
 
@@ -524,7 +537,18 @@ class Trader:
                     else:
                         ok_entry = False
                 if ok_entry:
-                    self.open_leg(sig)
+                    # Remote confirm 1 bar via Bybit OHLC
+                    if ENTRY_REQUIRE_SIGNAL_GUARD:
+                        try:
+                            gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                            if gsig != sig:
+                                logging.info("[%s] ENTRY-GUARD: remote sig=%+d != local sig=%+d → skip entry", self.symbol, gsig, sig)
+                                ok_entry = False
+                        except Exception as e:
+                            logging.warning("[%s] ENTRY-GUARD: API err=%s → block entry", self.symbol, e)
+                            ok_entry = False
+                    if ok_entry:
+                        self.open_leg(sig)
                 else:
                     logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
                                  self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
