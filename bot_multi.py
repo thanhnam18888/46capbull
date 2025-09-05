@@ -778,7 +778,7 @@ class MultiBot:
             except Exception as e:
                 now = time.time()
                 last = self._err_gate.get(s, 0.0)
-                if now - last >= 30.0:
+                if now - last >= 120.0:
                     self._err_gate[s] = now
                     logging.exception("[%s] step error: %s", s, e)
                 else:
