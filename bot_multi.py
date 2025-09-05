@@ -82,7 +82,7 @@ SCAN_SPREAD_SEC          = 0.0   # spread first requests into this window
 START_JITTER_MAX_SEC     = 0.0    # one-time jitter at pass start
 
 # Kline payload
-KLINE_LIMIT              = 61     # enough lookback for the signal
+KLINE_LIMIT              = 200     # enough lookback for the signal
 
 # Logging
 LOG_LEVEL                = "INFO" # DEBUG/INFO/WARNING/ERROR
@@ -784,13 +784,70 @@ class MultiBot:
                     now = time.time()
                     if now < target:
                         time.sleep(target - now)
-                # Startup-guard: only for the first entry on startup
+                # Startup-guard with fallback (avoid skipping true signals due to feed mismatch)
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
-                    gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
+                    gsig, last_open = _bulls_get_last_closed_sig_for_symbol(s)
+                    allow = True
                     if gsig == 0:
-                        logging.debug("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
-                        self._startup_skipped_syms.append(s)
-                        continue
+                        # Fallback tie-break: compare local vs remote-recalc on the same closed bar
+                        try:
+                            kl_local = t.klines_tf(limit=KLINE_LIMIT)
+                            if not kl_local or len(kl_local) < 61:
+                                allow = False
+                            else:
+                                # Ensure ascending by open time
+                                try:
+                                    if len(kl_local) >= 2 and int(kl_local[0][0]) > int(kl_local[-1][0]):
+                                        kl_local = sorted(kl_local, key=lambda x: int(x[0]))
+                                except Exception:
+                                    pass
+                                _compute = globals().get("__bulls__compute_signal_v5_from_klines")
+                                if _compute is None:
+                                    raise NameError("__bulls__compute_signal_v5_from_klines is missing")
+                                sigs_local = _compute(kl_local)
+                                idx_local = { int(row[0]): i for i, row in enumerate(kl_local) }
+                                lsig = int(sigs_local[idx_local.get(int(last_open), len(kl_local)-1)]) if int(last_open) in idx_local else 0
+                                if lsig != 0:
+                                    # Re-fetch remote OHLC (200 bars) and recompute
+                                    try:
+                                        url = "https://api.bybit.com/v5/market/kline"
+                                        start = int(last_open) - 400 * int(BARFRAME_SEC * 1000)
+                                        end   = int(last_open) + int(BARFRAME_SEC * 1000)
+                                        params = {"category":"linear","symbol":s,"interval":BYBIT_INTERVAL,"start":str(start),"end":str(end),"limit":"200"}
+                                        r = _requests.get(url, params=params, timeout=10); r.raise_for_status()
+                                        data = r.json()
+                                        lst = (data.get("result",{}) or {}).get("list") or []
+                                        lst.sort(key=lambda x: int(x[0]))
+                                        kl_remote = [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in lst]
+                                        _compute = globals().get("__bulls__compute_signal_v5_from_klines")
+                                        if _compute is None:
+                                            raise NameError("__bulls__compute_signal_v5_from_klines is missing")
+                                        sigs_remote = _compute(kl_remote)
+                                        idx_remote = { int(row[0]): i for i, row in enumerate(kl_remote) }
+                                        rsig = int(sigs_remote[idx_remote.get(int(last_open), len(kl_remote)-1)]) if int(last_open) in idx_remote else 0
+                                    except Exception:
+                                        rsig = 0
+                                    allow = (rsig == lsig)
+                                else:
+                                    allow = False
+                        except Exception as e:
+                            # Rate-limited warnings to avoid log spam
+                            try:
+                                self._startup_fallback_warns += 1
+                            except Exception:
+                                pass
+                            if getattr(self, "_startup_fallback_warns", 0) <= getattr(self, "_startup_fallback_warns_max", 5):
+                                logging.warning("[%s] STARTUP-GUARD fallback failed: %s", s, e)
+                                if self._startup_fallback_warns == self._startup_fallback_warns_max:
+                                    logging.warning("[STARTUP] further fallback warnings suppressed… (set MAX_STARTUP_WARN to increase)")
+                            else:
+                                logging.debug("[%s] STARTUP-GUARD fallback failed: %s", s, e)
+                            allow = False
+                        if not allow:
+                            logging.debug("[%s] STARTUP-GUARD: mismatch (gsig=0, local!=remote) → skip.", s)
+                            self._startup_skipped_syms.append(s)
+                            continue
+
                 prev_legs = t.legs
                 t.step()
                 if self._startup and prev_legs == 0 and t.legs > 0:
