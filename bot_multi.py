@@ -85,6 +85,8 @@ START_JITTER_MAX_SEC     = 0.0    # one-time jitter at pass start
 KLINE_LIMIT              = 61     # enough lookback for the signal
 
 # Logging
+DEBUG_ON_SYMBOLS       = {"ILVUSDT"}  # add symbols here to emit extra diagnostics
+
 LOG_LEVEL                = "INFO" # DEBUG/INFO/WARNING/ERROR
 LOG_BAR_SIG              = False  # log signal on each closed bar
 
@@ -455,6 +457,13 @@ class Trader:
         sig_arr = bulls_signal_from_klines_barclose(kl_closed)
         sig = sig_arr[-1]
 
+        if self.symbol in DEBUG_ON_SYMBOLS:
+            try:
+                _ts = int(kl_closed[-1][0])
+                logging.info("[DEBUG][%s] local last_closed ts=%d sig=%+d close=%.6f", self.symbol, _ts, int(sig), float(kl_closed[-1][4]))
+            except Exception:
+                pass
+
         price_ref = self.last_close
 
         if LOG_BAR_SIG:
@@ -806,6 +815,14 @@ class MultiBot:
                     now = time.time()
                     if now < target:
                         time.sleep(target - now)
+                # Debug: emit remote gsig on last CLOSED bar for selected symbols
+                try:
+                    if s in DEBUG_ON_SYMBOLS:
+                        gsig_dbg, last_open_dbg = _bulls_get_last_closed_sig_for_symbol(s)
+                        logging.info("[DEBUG][%s] last_open=%d gsig=%+d", s, int(last_open_dbg), int(gsig_dbg))
+                except Exception as _e:
+                    logging.info("[DEBUG][%s] remote gsig check error: %s", s, _e)
+                
                 # Startup-guard: only for the first entry on startup
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
                     gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
