@@ -525,43 +525,82 @@ class Trader:
                     return
 
         # ---- ENTRY when flat ----
+
         if self.dir == 0:
+
             if sig != 0:
+
                 ok_entry = True
+
                 if ENTRY_CONFIRM_BARS > 1:
+
                     if len(sig_arr) >= ENTRY_CONFIRM_BARS:
+
                         tail = sig_arr[-ENTRY_CONFIRM_BARS:]
+
                         ok_entry = all(s == sig for s in tail)
+
                     else:
+
                         ok_entry = False
+
                 if ok_entry:
+
                     try:
+
                         gsig, _r_last_open = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+
                         if gsig != sig:
+
                             # Comprehensive audit log for ALL symbols when ENTRY-GUARD skips
+
                             try:
+
                                 _local_last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+
                             except Exception:
+
                                 _local_last_open = -1
+
                             try:
+
                                 _local_last_closed_ts = int(kl_closed[-1][0])
+
                                 _local_close = float(kl_closed[-1][4])
+
                             except Exception:
+
                                 _local_last_closed_ts = -1
+
                                 _local_close = float('nan')
+
                             logging.info(
+
                                 "[ENTRY-GUARD][SKIP][%s] remote_last_open=%d remote_sig=%+d local_last_open=%d local_last_closed_ts=%d local_sig=%+d local_close=%.6f",
+
                                 self.symbol, int(_r_last_open), int(gsig), int(_local_last_open), int(_local_last_closed_ts), int(sig), _local_close,
+
                             )
+
                         else:
+
                             self.open_leg(sig)
+
                     except Exception as e:
+
                         logging.warning("[%s] ENTRY-GUARD: API err=%s → block entry", self.symbol, e)
+
                         pass
-else:
+
+                else:
+
                     logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
+
                                  self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
-            return
+
+                return
+
+
 
         # ---- POSITION MANAGEMENT ----
         upnl = self._upnl_from_price(price_ref)
