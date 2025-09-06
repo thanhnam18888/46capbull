@@ -85,8 +85,6 @@ START_JITTER_MAX_SEC     = 0.0    # one-time jitter at pass start
 KLINE_LIMIT              = 61     # enough lookback for the signal
 
 # Logging
-DEBUG_ON_SYMBOLS       = {"ILVUSDT"}  # add symbols here to emit extra diagnostics
-
 LOG_LEVEL                = "INFO" # DEBUG/INFO/WARNING/ERROR
 LOG_BAR_SIG              = False  # log signal on each closed bar
 
@@ -439,13 +437,7 @@ class Trader:
                 kl = kl[:-1]
         except Exception:
             pass
-        # === Enforce strictly the LAST CLOSED bar (sync with remote guard) ===
-        try:
-            last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
-            kl = [row for row in kl if int(row[0]) <= int(last_open)]
-        except Exception:
-            pass
-        # === END enforce last closed bar ===
+        # === END: closed-bar & ordering guard ===
 
         kl_closed = kl
         last_ts = int(kl_closed[-1][0])
@@ -456,13 +448,6 @@ class Trader:
 
         sig_arr = bulls_signal_from_klines_barclose(kl_closed)
         sig = sig_arr[-1]
-
-        if self.symbol in DEBUG_ON_SYMBOLS:
-            try:
-                _ts = int(kl_closed[-1][0])
-                logging.info("[DEBUG][%s] local last_closed ts=%d sig=%+d close=%.6f", self.symbol, _ts, int(sig), float(kl_closed[-1][4]))
-            except Exception:
-                pass
 
         price_ref = self.last_close
 
@@ -550,10 +535,24 @@ class Trader:
                     else:
                         ok_entry = False
                 if ok_entry:
-                    try:
-                        gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                                        try:
+                        gsig, _r_last_open = _bulls_get_last_closed_sig_for_symbol(self.symbol)
                         if gsig != sig:
-                            logging.info("[%s] ENTRY-GUARD: remote sig=%+d != local sig=%+d → skip entry", self.symbol, gsig, sig)
+                            # Comprehensive audit log for ALL symbols when ENTRY-GUARD skips
+                            try:
+                                _local_last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+                            except Exception:
+                                _local_last_open = -1
+                            try:
+                                _local_last_closed_ts = int(kl_closed[-1][0])
+                                _local_close = float(kl_closed[-1][4])
+                            except Exception:
+                                _local_last_closed_ts = -1
+                                _local_close = float('nan')
+                            logging.info(
+                                "[ENTRY-GUARD][SKIP][%s] remote_last_open=%d remote_sig=%+d local_last_open=%d local_last_closed_ts=%d local_sig=%+d local_close=%.6f",
+                                self.symbol, int(_r_last_open), int(gsig), int(_local_last_open), int(_local_last_closed_ts), int(sig), _local_close,
+                            )
                         else:
                             self.open_leg(sig)
                     except Exception as e:
@@ -815,14 +814,6 @@ class MultiBot:
                     now = time.time()
                     if now < target:
                         time.sleep(target - now)
-                # Debug: emit remote gsig on last CLOSED bar for selected symbols
-                try:
-                    if s in DEBUG_ON_SYMBOLS:
-                        gsig_dbg, last_open_dbg = _bulls_get_last_closed_sig_for_symbol(s)
-                        logging.info("[DEBUG][%s] last_open=%d gsig=%+d", s, int(last_open_dbg), int(gsig_dbg))
-                except Exception as _e:
-                    logging.info("[DEBUG][%s] remote gsig check error: %s", s, _e)
-                
                 # Startup-guard: only for the first entry on startup
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
                     gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
