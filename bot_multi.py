@@ -410,8 +410,9 @@ class Trader:
         self.tp_px = None
         self.tp_deadline = 0.0
 
-        logging.info("[%s] OPEN leg #%d dir=%+d qty=%.6f @ %.6f (avg=%.6f)",
-                     self.symbol, self.legs, self.dir, qty, price, self.avg)
+        label = "DCA" if self.legs > 1 else "ENTRY"
+        logging.info("[%s] %s leg #%d dir=%+d qty=%.6f @ %.6f (avg=%.6f)",
+                     self.symbol, label, self.legs, self.dir, qty, price, self.avg)
 
     def close_all(self):
         if self.dir == 0 or self.qty <= 0:
@@ -542,19 +543,25 @@ class Trader:
 
         upnl = self._upnl_from_price(price_ref)
 
+        # Close immediately when pyramided and non-negative PnL (as requested)
+        if self.legs > 1 and upnl >= 0.0:
+            logging.info("[%s] đóng lệnh khi >1 leg và UPnL ≥ 0 (legs=%d, upnl=%.6f)", self.symbol, self.legs, upnl)
+            self.close_all()
+            return
+
+
         if sig == self.dir:
             if upnl < 0.0:
-                if MAX_DCA < 0 or self.legs < 1 + MAX_DCA:
-                    self.open_leg(self.dir)
-                else:
-                    logging.info("[%s] MAX_DCA reached; skip DCA", self.symbol)
-        elif sig == -self.dir:
+                self.open_leg(self.dir)
+elif sig == -self.dir:
             if self.legs == 1:
+                logging.info("[%s] đảo chiều khi gặp tín hiệu ngược", self.symbol)
                 self.close_all()
                 self.open_leg(-self.dir)
                 return
             else:
                 if upnl >= 0.0 or (FLIP_ON_PROFIT and upnl > 0.0):
+                    logging.info("[%s] đảo chiều khi gặp tín hiệu ngược", self.symbol)
                     self.close_all()
                     self.open_leg(-self.dir)
                     return
