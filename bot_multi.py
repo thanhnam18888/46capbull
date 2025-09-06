@@ -10,7 +10,7 @@
 # - Kline cadence slowed via RL_KLINE_SEC (default 0.35s) + exponential backoff on 10006.
 # - No automatic "close-pass" retries by default (CLOSE_PASS_RETRIES=0) to avoid bursts after close.
 # - Reduced kline payload (KLINE_LIMIT=120) – still >= 61 bars for signal.
-STARTUP_KLINE_LIMIT = env_int("STARTUP_KLINE_LIMIT", 200)
+
 # - Hourly dynamic leg uses leverage: dynamic_leg_usdt = (equity / 120) * LEVERAGE_X
 # - Budget/exposure computed from last_close/avg when possible (avoid ticker-spam).
 #
@@ -91,6 +91,8 @@ RL_MISC_SEC   = env_float("RL_MISC_SEC",   0.12)
 
 # Kline payload
 KLINE_LIMIT   = max(61, env_int("KLINE_LIMIT", 200))  # 61+ required for signal
+STARTUP_KLINE_LIMIT = env_int("STARTUP_KLINE_LIMIT", 200)  # used for the very first kline fetch on startup
+
 
 _level_map = {
     "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
@@ -782,13 +784,6 @@ class MultiBot:
 
             next_close += int(BARFRAME_SEC)
 
-# ---------- Main ----------
-if __name__ == "__main__":
-    syms = read_pairs(PAIRS_FILE)
-    if not syms:
-        raise SystemExit(f"No symbols loaded from {PAIRS_FILE}")
-    MultiBot(syms).loop()
-
 # ================== BEGIN: STARTUP SIGNAL GUARD (no logic change) ==================
 # Purpose: When the bot restarts mid-hour (startup pass), avoid opening a NEW position
 # if the last CLOSED H1 bar has no signal (sig==0). This keeps 100% of your trading
@@ -939,3 +934,12 @@ try:
 except Exception as _e:
     pass
 # =================== END: STARTUP SIGNAL GUARD (no logic change) ===================
+
+# ---------- Main ----------
+if __name__ == "__main__":
+    syms = read_pairs(PAIRS_FILE)
+    if not syms:
+        raise SystemExit(f"No symbols loaded from {PAIRS_FILE}")
+    MultiBot(syms).loop()
+
+
