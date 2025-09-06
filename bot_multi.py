@@ -439,7 +439,17 @@ class Trader:
             pass
         # === END: closed-bar & ordering guard ===
 
-        kl_closed = kl
+        
+        # === Enforce strictly the LAST CLOSED bar (sync with remote guard) ===
+        try:
+            last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+            if self.symbol in DEBUG_ON_SYMBOLS:
+                logging.info("[DEBUG][%s] local last_open=%d (ms)", self.symbol, int(last_open))
+            kl = [row for row in kl if int(row[0]) <= int(last_open)]
+        except Exception:
+            pass
+        # === END enforce last closed bar ===
+kl_closed = kl
         last_ts = int(kl_closed[-1][0])
         if self.last_bar_ts == last_ts:
             return
@@ -449,6 +459,26 @@ class Trader:
         sig_arr = bulls_signal_from_klines_barclose(kl_closed)
         sig = sig_arr[-1]
 
+
+        # If local sig==0 but remote gsig!=0, log audit (helps detect nến lệch)
+        try:
+            if self.dir == 0 and sig == 0:
+                _r_sig, _r_last_open = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                if _r_sig != 0:
+                    try:
+                        _local_last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+                    except Exception:
+                        _local_last_open = -1
+                    try:
+                        _local_last_closed_ts = int(kl_closed[-1][0])
+                        _local_close = float(kl_closed[-1][4])
+                    except Exception:
+                        _local_last_closed_ts = -1
+                        _local_close = float('nan')
+                    logging.info("[ENTRY-GUARD][SKIP][%s] remote_last_open=%d remote_sig=%+d local_last_open=%d local_last_closed_ts=%d local_sig=%+d local_close=%.6f (local==0)",
+                                 self.symbol, int(_r_last_open), int(_r_sig), int(_local_last_open), int(_local_last_closed_ts), int(sig), _local_close)
+        except Exception:
+            pass
         price_ref = self.last_close
 
         if LOG_BAR_SIG:
