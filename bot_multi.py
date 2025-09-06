@@ -82,7 +82,7 @@ SCAN_SPREAD_SEC          = 0.0   # spread first requests into this window
 START_JITTER_MAX_SEC     = 0.0    # one-time jitter at pass start
 
 # Kline payload
-KLINE_LIMIT              = 200     # enough lookback for the signal
+KLINE_LIMIT              = 61     # enough lookback for the signal
 
 # Logging
 LOG_LEVEL                = "INFO" # DEBUG/INFO/WARNING/ERROR
@@ -462,17 +462,25 @@ class Trader:
 
         # Flip immediately if single-leg and signal flipped
         if self.dir != 0 and self.legs == 1 and sig == -self.dir:
-            if getattr(self, "tp_pending", False):
-                try:
-                    self.cancel_all_orders()
-                except Exception:
-                    pass
-                self.tp_pending = False
-                self.tp_px = None
-                self.tp_deadline = 0.0
-            self.close_all()
-            self.open_leg(-self.dir)
-            return
+            try:
+                gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                if gsig != -self.dir:
+                    logging.info("[%s] FLIP-GUARD(l1): confirm failed gsig=%+d need=%+d → skip flip", self.symbol, gsig, -self.dir)
+                else:
+                    if getattr(self, "tp_pending", False):
+                        try:
+                            self.cancel_all_orders()
+                        except Exception:
+                            pass
+                        self.tp_pending = False
+                        self.tp_px = None
+                        self.tp_deadline = 0.0
+                    self.close_all()
+                    self.open_leg(-self.dir)
+                    return
+            except Exception as e:
+                logging.warning("[%s] FLIP-GUARD(l1): API err=%s → block flip", self.symbol, e)
+                pass
 
         self._funding_tick(price_ref)
 
@@ -527,7 +535,15 @@ class Trader:
                     else:
                         ok_entry = False
                 if ok_entry:
-                    self.open_leg(sig)
+                    try:
+                        gsig, _ = _bulls_get_last_closed_sig_for_symbol(self.symbol)
+                        if gsig != sig:
+                            logging.info("[%s] ENTRY-GUARD: remote sig=%+d != local sig=%+d → skip entry", self.symbol, gsig, sig)
+                        else:
+                            self.open_leg(sig)
+                    except Exception as e:
+                        logging.warning("[%s] ENTRY-GUARD: API err=%s → block entry", self.symbol, e)
+                        pass
                 else:
                     logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
                                  self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
@@ -784,70 +800,13 @@ class MultiBot:
                     now = time.time()
                     if now < target:
                         time.sleep(target - now)
-                # Startup-guard with fallback (avoid skipping true signals due to feed mismatch)
+                # Startup-guard: only for the first entry on startup
                 if self._startup and self.STARTUP_REQUIRE_SIGNAL and t.legs == 0:
-                    gsig, last_open = _bulls_get_last_closed_sig_for_symbol(s)
-                    allow = True
+                    gsig, _ = _bulls_get_last_closed_sig_for_symbol(s)
                     if gsig == 0:
-                        # Fallback tie-break: compare local vs remote-recalc on the same closed bar
-                        try:
-                            kl_local = t.klines_tf(limit=KLINE_LIMIT)
-                            if not kl_local or len(kl_local) < 61:
-                                allow = False
-                            else:
-                                # Ensure ascending by open time
-                                try:
-                                    if len(kl_local) >= 2 and int(kl_local[0][0]) > int(kl_local[-1][0]):
-                                        kl_local = sorted(kl_local, key=lambda x: int(x[0]))
-                                except Exception:
-                                    pass
-                                _compute = globals().get("__bulls__compute_signal_v5_from_klines")
-                                if _compute is None:
-                                    raise NameError("__bulls__compute_signal_v5_from_klines is missing")
-                                sigs_local = _compute(kl_local)
-                                idx_local = { int(row[0]): i for i, row in enumerate(kl_local) }
-                                lsig = int(sigs_local[idx_local.get(int(last_open), len(kl_local)-1)]) if int(last_open) in idx_local else 0
-                                if lsig != 0:
-                                    # Re-fetch remote OHLC (200 bars) and recompute
-                                    try:
-                                        url = "https://api.bybit.com/v5/market/kline"
-                                        start = int(last_open) - 400 * int(BARFRAME_SEC * 1000)
-                                        end   = int(last_open) + int(BARFRAME_SEC * 1000)
-                                        params = {"category":"linear","symbol":s,"interval":BYBIT_INTERVAL,"start":str(start),"end":str(end),"limit":"200"}
-                                        r = _requests.get(url, params=params, timeout=10); r.raise_for_status()
-                                        data = r.json()
-                                        lst = (data.get("result",{}) or {}).get("list") or []
-                                        lst.sort(key=lambda x: int(x[0]))
-                                        kl_remote = [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])] for x in lst]
-                                        _compute = globals().get("__bulls__compute_signal_v5_from_klines")
-                                        if _compute is None:
-                                            raise NameError("__bulls__compute_signal_v5_from_klines is missing")
-                                        sigs_remote = _compute(kl_remote)
-                                        idx_remote = { int(row[0]): i for i, row in enumerate(kl_remote) }
-                                        rsig = int(sigs_remote[idx_remote.get(int(last_open), len(kl_remote)-1)]) if int(last_open) in idx_remote else 0
-                                    except Exception:
-                                        rsig = 0
-                                    allow = (rsig == lsig)
-                                else:
-                                    allow = False
-                        except Exception as e:
-                            # Rate-limited warnings to avoid log spam
-                            try:
-                                self._startup_fallback_warns += 1
-                            except Exception:
-                                pass
-                            if getattr(self, "_startup_fallback_warns", 0) <= getattr(self, "_startup_fallback_warns_max", 5):
-                                logging.warning("[%s] STARTUP-GUARD fallback failed: %s", s, e)
-                                if self._startup_fallback_warns == self._startup_fallback_warns_max:
-                                    logging.warning("[STARTUP] further fallback warnings suppressed… (set MAX_STARTUP_WARN to increase)")
-                            else:
-                                logging.debug("[%s] STARTUP-GUARD fallback failed: %s", s, e)
-                            allow = False
-                        if not allow:
-                            logging.debug("[%s] STARTUP-GUARD: mismatch (gsig=0, local!=remote) → skip.", s)
-                            self._startup_skipped_syms.append(s)
-                            continue
-
+                        logging.debug("[%s] STARTUP-GUARD(TF=%s): last-closed sig=0 → skip opening new position.", s, TF_LABEL)
+                        self._startup_skipped_syms.append(s)
+                        continue
                 prev_legs = t.legs
                 t.step()
                 if self._startup and prev_legs == 0 and t.legs > 0:
@@ -946,6 +905,10 @@ def _bulls_get_last_closed_sig_for_symbol(sym: str):
         if _requests is None:
             return 0, __bulls__last_open_ms(int(BARFRAME_SEC))
         last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+        _key = (sym, int(last_open))
+        _val = _last_closed_sig_cache.get(_key)
+        if _val is not None:
+            return _val
         start = last_open - 400 * int(BARFRAME_SEC * 1000)
         end   = last_open + int(BARFRAME_SEC * 1000)
         params = {"category": "linear", "symbol": sym, "interval": BYBIT_INTERVAL,
@@ -965,6 +928,7 @@ def _bulls_get_last_closed_sig_for_symbol(sym: str):
         if last_open not in idx:
             return 0, last_open
         sigs = __bulls__compute_signal_v5_from_klines(kl)
+        _last_closed_sig_cache[_key] = (int(sigs[idx[last_open]]), last_open)
         return int(sigs[idx[last_open]]), last_open
     except Exception:
         return 0, __bulls__last_open_ms(int(BARFRAME_SEC))
