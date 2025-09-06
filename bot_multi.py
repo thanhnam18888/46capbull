@@ -55,7 +55,7 @@ PAIRS_FILE       = env_str("PAIRS_FILE", "46cap.txt")
 TAKER_FEE        = env_float("TAKER_FEE", 0.0)          # keep 0 for parity
 FUNDING_8H       = env_float("FUNDING_RATE_8H", 0.0)    # 0 by default
 
-MAX_DCA          = env_int("MAX_DCA", -1)               # -1 = unlimited
+MAX_DCA = -1  # DCA unlimited (env ignored)               # -1 = unlimited
 TP_PCT           = env_float("TP_PCT", 0.0)             # 0 = disabled
 TP_TTL_SEC       = env_float("TP_TTL_SEC", 8.0)
 TP_POST_ONLY     = env_int("TP_POST_ONLY", 1) == 1
@@ -91,8 +91,6 @@ RL_MISC_SEC   = env_float("RL_MISC_SEC",   0.12)
 
 # Kline payload
 KLINE_LIMIT   = max(61, env_int("KLINE_LIMIT", 200))  # 61+ required for signal
-STARTUP_KLINE_LIMIT = env_int("STARTUP_KLINE_LIMIT", 200)  # used for the very first kline fetch on startup
-
 
 _level_map = {
     "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
