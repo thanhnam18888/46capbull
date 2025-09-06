@@ -553,7 +553,7 @@ class Trader:
         if sig == self.dir:
             if upnl < 0.0:
                 self.open_leg(self.dir)
-elif sig == -self.dir:
+        elif sig == -self.dir:
             if self.legs == 1:
                 logging.info("[%s] đảo chiều khi gặp tín hiệu ngược", self.symbol)
                 self.close_all()
