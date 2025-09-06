@@ -437,7 +437,13 @@ class Trader:
                 kl = kl[:-1]
         except Exception:
             pass
-        # === END: closed-bar & ordering guard ===
+        # === Enforce strictly the LAST CLOSED bar (sync with remote guard) ===
+        try:
+            last_open = __bulls__last_open_ms(int(BARFRAME_SEC))
+            kl = [row for row in kl if int(row[0]) <= int(last_open)]
+        except Exception:
+            pass
+        # === END enforce last closed bar ===
 
         kl_closed = kl
         last_ts = int(kl_closed[-1][0])
