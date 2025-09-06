@@ -535,7 +535,7 @@ class Trader:
                     else:
                         ok_entry = False
                 if ok_entry:
-                                        try:
+                    try:
                         gsig, _r_last_open = _bulls_get_last_closed_sig_for_symbol(self.symbol)
                         if gsig != sig:
                             # Comprehensive audit log for ALL symbols when ENTRY-GUARD skips
@@ -558,7 +558,7 @@ class Trader:
                     except Exception as e:
                         logging.warning("[%s] ENTRY-GUARD: API err=%s → block entry", self.symbol, e)
                         pass
-                else:
+else:
                     logging.info("[%s] ENTRY-GUARD: require last %d bars sig=%+d; tail=%s → skip entry",
                                  self.symbol, ENTRY_CONFIRM_BARS, sig, str(sig_arr[-ENTRY_CONFIRM_BARS:]))
             return
