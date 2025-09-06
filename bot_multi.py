@@ -91,6 +91,7 @@ RL_MISC_SEC   = env_float("RL_MISC_SEC",   0.12)
 
 # Kline payload
 KLINE_LIMIT   = max(61, env_int("KLINE_LIMIT", 200))  # 61+ required for signal
+STARTUP_KLINE_LIMIT = env_int("STARTUP_KLINE_LIMIT", int(KLINE_LIMIT))  # fallback to KLINE_LIMIT
 
 _level_map = {
     "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
@@ -444,7 +445,7 @@ class Trader:
     def step(self):
         if getattr(self, 'disabled', False):
             return
-        limit0 = STARTUP_KLINE_LIMIT if (self.last_bar_ts is None) else KLINE_LIMIT
+        limit0 = (globals().get("STARTUP_KLINE_LIMIT", KLINE_LIMIT)) if (self.last_bar_ts is None) else KLINE_LIMIT
         kl = self.klines_1h(limit=int(limit0))
         if not kl or len(kl) < 61:
             logging.debug("[%s] insufficient klines; skip", self.symbol)
